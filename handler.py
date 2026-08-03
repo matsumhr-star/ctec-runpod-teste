@@ -16,6 +16,7 @@ import runpod
 import torch
 import torchaudio
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from num2words import num2words
 
 try:
     from faster_whisper import WhisperModel
@@ -213,22 +214,169 @@ def get_model() -> ChatterboxMultilingualTTS:
     return _MODEL
 
 
-def normalize_law_text(text: str) -> str:
-    text = re.sub(r"\bArt\.\s*(\d+)", r"Artigo \1", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bArts\.\s*", "Artigos ", text, flags=re.IGNORECASE)
-    text = re.sub(r"§\s*(\d+)º?", r"Parágrafo \1", text)
-    text = re.sub(r"§\s*único", "Parágrafo único", text, flags=re.IGNORECASE)
-    text = re.sub(r"\binc\.\s*", "inciso ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bal\.\s*", "alínea ", text, flags=re.IGNORECASE)
+
+ROMAN_VALUES = {
+    "I": 1, "V": 5, "X": 10, "L": 50,
+    "C": 100, "D": 500, "M": 1000,
+}
+
+
+def roman_to_int(value: str) -> int:
+    value = value.upper().strip()
+    total = 0
+    previous = 0
+    for char in reversed(value):
+        current = ROMAN_VALUES.get(char, 0)
+        if current < previous:
+            total -= current
+        else:
+            total += current
+            previous = current
+    return total
+
+
+def number_words(value: int, ordinal: bool = False) -> str:
+    try:
+        return num2words(value, lang="pt_BR", to="ordinal" if ordinal else "cardinal")
+    except Exception:
+        return str(value)
+
+
+def apply_pronunciation_dictionary(
+    text: str,
+    custom_dictionary: list[dict[str, Any]] | None,
+) -> str:
+    items = custom_dictionary or []
+    items = sorted(
+        items,
+        key=lambda item: len(str(item.get("source") or "")),
+        reverse=True,
+    )
+    for item in items:
+        source = str(item.get("source") or "").strip()
+        spoken = str(item.get("spoken") or "").strip()
+        if not source or not spoken:
+            continue
+        text = re.sub(re.escape(source), spoken, text, flags=re.IGNORECASE)
     return text
 
 
-def prepare_text(text: str, mode: str) -> str:
+def normalize_law_text(
+    text: str,
+    custom_dictionary: list[dict[str, Any]] | None = None,
+) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"^[,;:\s]+", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    text = apply_pronunciation_dictionary(text, custom_dictionary)
+
+    text = re.sub(r"§\s*único", "Parágrafo único", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"§\s*(\d+)\s*[º°]?",
+        lambda match: f"Parágrafo {number_words(int(match.group(1)), True)}",
+        text,
+    )
+    text = re.sub(
+        r"\bArts?\.\s*(\d+)\s*[º°]?",
+        lambda match: (
+            f"Artigo {number_words(int(match.group(1)), True)}"
+            if int(match.group(1)) <= 9
+            else f"Artigo {number_words(int(match.group(1)))}"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\bArtigo\s+(\d+)\s*[º°]?",
+        lambda match: (
+            f"Artigo {number_words(int(match.group(1)), True)}"
+            if int(match.group(1)) <= 9
+            else f"Artigo {number_words(int(match.group(1)))}"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    def roman_line(match: re.Match[str]) -> str:
+        value = roman_to_int(match.group(1))
+        return f"{match.group(2)}Inciso {number_words(value)}. "
+
+    text = re.sub(
+        r"(?m)^\s*([IVXLCDM]{1,12})\s*[—–-]\s*",
+        lambda match: f"Inciso {number_words(roman_to_int(match.group(1)))}. ",
+        text,
+    )
+    text = re.sub(
+        r"\binciso\s+([IVXLCDM]{1,12})\b",
+        lambda match: f"inciso {number_words(roman_to_int(match.group(1)))}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*([a-z])\)\s*",
+        lambda match: f"Alínea {match.group(1)}. ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*(\d+)\.\s+",
+        lambda match: f"Item {number_words(int(match.group(1)))}. ",
+        text,
+    )
+
+    fixed = [
+        (r"\bcaput\b", "cáput"),
+        (r"\bn[.º°]\s*", "número "),
+        (r"\bc/c\b", "combinado com"),
+        (r"\bCF/88\b", "Constituição Federal de mil novecentos e oitenta e oito"),
+        (r"\bCRFB/88\b", "Constituição da República Federativa do Brasil de mil novecentos e oitenta e oito"),
+        (r"\bCPP\b", "Código de Processo Penal"),
+        (r"\bCP\b", "Código Penal"),
+        (r"\bCPC\b", "Código de Processo Civil"),
+        (r"\bSTF\b", "Supremo Tribunal Federal"),
+        (r"\bSTJ\b", "Superior Tribunal de Justiça"),
+    ]
+    for pattern, spoken in fixed:
+        text = re.sub(pattern, spoken, text, flags=re.IGNORECASE)
+
+    text = re.sub(
+        r"\bLei\s+número\s+(\d{1,6})(?:\.(\d{3}))?/(\d{2,4})\b",
+        lambda match: (
+            "Lei número "
+            + number_words(int((match.group(1) or "") + (match.group(2) or "")))
+            + ", de "
+            + number_words(
+                int(match.group(3))
+                if len(match.group(3)) == 4
+                else 2000 + int(match.group(3))
+            )
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(\d+(?:[.,]\d+)?)%",
+        lambda match: f"{number_words(int(float(match.group(1).replace(',', '.'))))} por cento",
+        text,
+    )
+
+    text = re.sub(r"\s*;\s*", ".\n", text)
+    text = re.sub(r"\s*:\s*", ":\n", text)
+    text = re.sub(r"\s*[—–]\s*", ". ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r" +([,.;:])", r"\1", text)
+    return text.strip()
+
+
+
+def prepare_text(text: str, mode: str, custom_dictionary=None) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if mode == "law":
-        text = normalize_law_text(text)
+        text = normalize_law_text(text, custom_dictionary)
     return text
 
 
@@ -602,13 +750,15 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "2.0.0",
+        "version": "3.1.0",
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
         "profiles": PROFILES,
         "supported_languages": sorted(SUPPORTED_LANGUAGES),
         "reference_inputs": ["voice_id", "reference_audio_url", "reference_audio_base64"],
         "output_formats": ["mp3", "wav"],
+        "legal_normalization": True,
+        "custom_pronunciation_dictionary": True,
     }
 
 
@@ -622,6 +772,21 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
     if action == "calibrate":
         return calibrate(job, data)
 
+    if action == "normalize_legal_text":
+        original = str(data.get("text") or "")
+        dictionary = data.get("pronunciation_dictionary")
+        prepared = normalize_law_text(
+            original,
+            dictionary if isinstance(dictionary, list) else [],
+        )
+        return {
+            "status": "ok",
+            "action": "normalize_legal_text",
+            "prepared_text": prepared,
+            "original_characters": len(original),
+            "prepared_characters": len(prepared),
+        }
+
     text = str(data.get("text") or "").strip()
     if len(text) < 3:
         raise ValueError("O texto precisa ter pelo menos 3 caracteres.")
@@ -633,7 +798,12 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Idioma não suportado: {language_id}")
 
     settings = resolve_settings(data)
-    text = prepare_text(text, settings["text_mode"])
+    custom_dictionary = data.get("pronunciation_dictionary")
+    text = prepare_text(
+        text,
+        settings["text_mode"],
+        custom_dictionary if isinstance(custom_dictionary, list) else [],
+    )
 
     if to_bool(data.get("preview"), False):
         preview_chars = int(clamp(float(data.get("preview_chars", 450)), 80, 1500))
