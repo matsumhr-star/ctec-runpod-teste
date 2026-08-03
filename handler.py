@@ -750,7 +750,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "3.1.0",
+        "version": "3.1.1",
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
         "profiles": PROFILES,
@@ -760,6 +760,133 @@ def capabilities() -> dict[str, Any]:
         "legal_normalization": True,
         "custom_pronunciation_dictionary": True,
     }
+
+
+
+def clean_generation_chunk(value: str) -> str:
+    value = str(value or "")
+    value = value.replace("\u200b", " ").replace("\ufeff", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"^[,;:.!?—–\-\s]+", "", value)
+    value = re.sub(r"[,;:.!?—–\-\s]+$", ".", value)
+    value = re.sub(r"\s+([,.;:!?])", r"\1", value)
+    return value.strip()
+
+
+def is_valid_generation_chunk(value: str) -> bool:
+    cleaned = clean_generation_chunk(value)
+    letters_or_numbers = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]", cleaned)
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", cleaned)
+    return len(letters_or_numbers) >= 3 and len(words) >= 1
+
+
+def merge_tiny_chunks(
+    chunks: list[tuple[str, bool]],
+    minimum_chars: int = 18,
+) -> list[tuple[str, bool]]:
+    merged: list[tuple[str, bool]] = []
+    pending = ""
+
+    for raw_chunk, paragraph_end in chunks:
+        chunk = clean_generation_chunk(raw_chunk)
+        if not is_valid_generation_chunk(chunk):
+            continue
+
+        if len(chunk) < minimum_chars:
+            pending = f"{pending} {chunk}".strip()
+            if paragraph_end and pending:
+                if merged:
+                    previous, _ = merged.pop()
+                    merged.append((f"{previous} {pending}".strip(), True))
+                else:
+                    merged.append((pending, True))
+                pending = ""
+            continue
+
+        if pending:
+            chunk = f"{pending} {chunk}".strip()
+            pending = ""
+
+        merged.append((chunk, paragraph_end))
+
+    if pending:
+        if merged:
+            previous, paragraph_end = merged.pop()
+            merged.append((f"{previous} {pending}".strip(), paragraph_end))
+        elif is_valid_generation_chunk(pending):
+            merged.append((pending, True))
+
+    return merged
+
+
+def generate_chunk_with_retry(
+    model: ChatterboxMultilingualTTS,
+    chunk: str,
+    *,
+    language_id: str,
+    reference_path: Path,
+    settings: dict[str, Any],
+    chunk_index: int,
+    total_chunks: int,
+) -> torch.Tensor:
+    attempts = [
+        {
+            "text": clean_generation_chunk(chunk),
+            "temperature": float(settings["temperature"]),
+            "exaggeration": float(settings["exaggeration"]),
+            "cfg_weight": float(settings["cfg_weight"]),
+        },
+        {
+            "text": clean_generation_chunk(chunk).rstrip(".") + ".",
+            "temperature": min(float(settings["temperature"]), 0.55),
+            "exaggeration": min(float(settings["exaggeration"]), 0.42),
+            "cfg_weight": max(float(settings["cfg_weight"]), 0.58),
+        },
+    ]
+
+    last_error: Exception | None = None
+    for attempt_index, attempt in enumerate(attempts, start=1):
+        candidate = attempt["text"]
+        if not is_valid_generation_chunk(candidate):
+            raise ValueError(
+                f"Trecho {chunk_index}/{total_chunks} ficou vazio ou inválido "
+                "depois da preparação jurídica."
+            )
+
+        try:
+            print(
+                f"[CTEC] Trecho {chunk_index}/{total_chunks}, "
+                f"tentativa {attempt_index}: {candidate[:180]!r}",
+                flush=True,
+            )
+            audio = model.generate(
+                candidate,
+                language_id=language_id,
+                audio_prompt_path=str(reference_path),
+                exaggeration=attempt["exaggeration"],
+                cfg_weight=attempt["cfg_weight"],
+                temperature=attempt["temperature"],
+                repetition_penalty=float(settings["repetition_penalty"]),
+                min_p=float(settings["min_p"]),
+                top_p=float(settings["top_p"]),
+            ).detach().cpu()
+
+            if audio.numel() == 0:
+                raise RuntimeError("O modelo devolveu um tensor de áudio vazio.")
+            return audio
+        except (IndexError, RuntimeError) as error:
+            last_error = error
+            print(
+                f"[CTEC] Falha no trecho {chunk_index}/{total_chunks}, "
+                f"tentativa {attempt_index}: {type(error).__name__}: {error}",
+                flush=True,
+            )
+
+    raise RuntimeError(
+        f"O Chatterbox falhou ao gerar o trecho {chunk_index}/{total_chunks}. "
+        f"Trecho: {clean_generation_chunk(chunk)[:220]!r}. "
+        f"Erro final: {last_error}"
+    )
 
 
 def generate(job: dict[str, Any]) -> dict[str, Any]:
@@ -810,8 +937,11 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         text = text[:preview_chars].rsplit(" ", 1)[0].strip() or text[:preview_chars]
 
     chunks = split_text(text, int(settings["chunk_limit"]))
+    chunks = merge_tiny_chunks(chunks)
     if not chunks:
-        raise ValueError("Não foi possível dividir o texto para geração.")
+        raise ValueError(
+            "O texto não gerou nenhum trecho válido depois da preparação jurídica."
+        )
 
     output_format = str(data.get("output_format") or "mp3").strip().lower()
     if output_format not in {"mp3", "wav"}:
@@ -842,17 +972,15 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
             runpod.serverless.progress_update(job, f"Gerando trecho {index} de {total}")
             print(f"[CTEC] Gerando trecho {index}/{total}", flush=True)
 
-            audio = model.generate(
+            audio = generate_chunk_with_retry(
+                model,
                 chunk,
                 language_id=language_id,
-                audio_prompt_path=str(reference_path),
-                exaggeration=float(settings["exaggeration"]),
-                cfg_weight=float(settings["cfg_weight"]),
-                temperature=float(settings["temperature"]),
-                repetition_penalty=float(settings["repetition_penalty"]),
-                min_p=float(settings["min_p"]),
-                top_p=float(settings["top_p"]),
-            ).detach().cpu()
+                reference_path=reference_path,
+                settings=settings,
+                chunk_index=index,
+                total_chunks=total,
+            )
 
             if audio.ndim == 1:
                 audio = audio.unsqueeze(0)
