@@ -5,7 +5,14 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/root/.cache/huggingface \
-    CTEC_WHISPER_MODEL=small
+    CTEC_CHATTERBOX_MODEL=v3 \
+    CTEC_WHISPER_MODEL=small \
+    CTEC_CHUNK_TARGET=250 \
+    CTEC_CHUNK_MAX=300 \
+    CTEC_MIN_SIMILARITY=0.92 \
+    CTEC_MIN_WORD_COVERAGE=0.94 \
+    CTEC_MAX_CHUNK_ATTEMPTS=3 \
+    CTEC_SEED_BASE=20260803
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
