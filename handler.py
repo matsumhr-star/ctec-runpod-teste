@@ -199,7 +199,6 @@ def get_model() -> ChatterboxMultilingualTTS:
                 )
                 _MODEL = ChatterboxMultilingualTTS.from_pretrained(
                     device=DEVICE,
-                    t3_model=MODEL_VERSION,
                 )
                 print("[CTEC] Modelo carregado com sucesso.", flush=True)
     return _MODEL
