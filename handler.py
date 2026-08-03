@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import threading
 import urllib.request
 import difflib
@@ -750,7 +751,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "3.1.1",
+        "version": "4.0.0",
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
         "profiles": PROFILES,
@@ -889,6 +890,187 @@ def generate_chunk_with_retry(
     )
 
 
+
+def upload_file_to_signed_url(
+    file_path: Path,
+    signed_url: str,
+    content_type: str,
+) -> None:
+    request = urllib.request.Request(
+        signed_url,
+        data=file_path.read_bytes(),
+        method="PUT",
+        headers={
+            "Content-Type": content_type,
+            "Content-Length": str(file_path.stat().st_size),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=900) as response:
+        if response.status not in {200, 201}:
+            raise RuntimeError(
+                f"Upload do áudio final falhou com HTTP {response.status}."
+            )
+
+
+def generate_long_project(
+    job: dict[str, Any],
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    text = str(data.get("text") or "").strip()
+    if len(text) < 100:
+        raise ValueError("O projeto longo precisa ter pelo menos 100 caracteres.")
+    if len(text) > 180000:
+        raise ValueError("O projeto longo excede 180.000 caracteres.")
+
+    upload_url = str(data.get("final_upload_url") or "").strip()
+    if not upload_url:
+        raise ValueError("URL assinada de upload final não foi enviada.")
+
+    language_id = str(data.get("language_id") or "pt").strip().lower()
+    settings = resolve_settings(data)
+    custom_dictionary = data.get("pronunciation_dictionary")
+    prepared = prepare_text(
+        text,
+        settings["text_mode"],
+        custom_dictionary if isinstance(custom_dictionary, list) else [],
+    )
+
+    chunks = merge_tiny_chunks(
+        split_text(prepared, int(settings["chunk_limit"]))
+    )
+    if not chunks:
+        raise ValueError("Nenhum trecho válido foi produzido.")
+
+    output_format = "mp3"
+    mp3_bitrate = str(data.get("mp3_bitrate") or "160k")
+    model = get_model()
+    started = time.time()
+
+    with _GENERATION_LOCK, tempfile.TemporaryDirectory(
+        prefix="ctec_long_voice_"
+    ) as tmp:
+        root = Path(tmp)
+        reference_path = save_reference_audio(data, root)
+        chunks_dir = root / "chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+        concat_file = root / "concat.txt"
+        final_path = root / "ctec-audio-longo.mp3"
+
+        marker_list = []
+        concat_lines = []
+        cumulative_seconds = 0.0
+        total = len(chunks)
+
+        for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
+            percent = 8 + int((index - 1) / max(1, total) * 82)
+            runpod.serverless.progress_update(
+                job,
+                json.dumps({
+                    "stage": "generating",
+                    "stageLabel": f"Gerando trecho {index} de {total}",
+                    "progress": percent / 100,
+                    "currentChunk": index,
+                    "totalChunks": total,
+                    "elapsedSeconds": int(time.time() - started),
+                }),
+            )
+
+            audio = generate_chunk_with_retry(
+                model,
+                chunk,
+                language_id=language_id,
+                reference_path=reference_path,
+                settings=settings,
+                chunk_index=index,
+                total_chunks=total,
+            )
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)
+
+            wav_path = chunks_dir / f"{index:05d}.wav"
+            mp3_path = chunks_dir / f"{index:05d}.mp3"
+            torchaudio.save(str(wav_path), audio, model.sr)
+
+            pause_ms = (
+                settings["pause_paragraph_ms"]
+                if paragraph_end
+                else settings["pause_sentence_ms"]
+            )
+            command = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(wav_path),
+                "-af", f"apad=pad_dur={pause_ms / 1000.0}",
+                "-codec:a", "libmp3lame",
+                "-b:a", mp3_bitrate,
+                str(mp3_path),
+            ]
+            subprocess.run(command, check=True)
+            concat_lines.append(f"file '{mp3_path.as_posix()}'")
+
+            duration = float(audio.shape[1] / model.sr)
+            marker_list.append({
+                "index": index,
+                "startSeconds": round(cumulative_seconds, 2),
+                "durationSeconds": round(duration, 2),
+                "text": chunk[:500],
+            })
+            cumulative_seconds += duration + pause_ms / 1000.0
+
+        runpod.serverless.progress_update(
+            job,
+            json.dumps({
+                "stage": "joining",
+                "stageLabel": "Unindo todos os trechos",
+                "progress": 0.93,
+                "currentChunk": total,
+                "totalChunks": total,
+                "elapsedSeconds": int(time.time() - started),
+            }),
+        )
+
+        concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_file),
+                "-codec:a", "copy",
+                str(final_path),
+            ],
+            check=True,
+        )
+
+        runpod.serverless.progress_update(
+            job,
+            json.dumps({
+                "stage": "uploading",
+                "stageLabel": "Salvando o áudio final",
+                "progress": 0.98,
+                "currentChunk": total,
+                "totalChunks": total,
+                "elapsedSeconds": int(time.time() - started),
+            }),
+        )
+        upload_file_to_signed_url(
+            final_path,
+            upload_url,
+            "audio/mpeg",
+        )
+
+        return {
+            "status": "ok",
+            "action": "generate_long_project",
+            "file_name": final_path.name,
+            "mime_type": "audio/mpeg",
+            "size_bytes": final_path.stat().st_size,
+            "duration_seconds": round(cumulative_seconds, 2),
+            "chunks": total,
+            "markers": marker_list,
+            "settings": settings,
+            "elapsed_seconds": int(time.time() - started),
+        }
+
+
 def generate(job: dict[str, Any]) -> dict[str, Any]:
     data = job.get("input") or {}
     action = str(data.get("action") or "generate").strip().lower()
@@ -898,6 +1080,9 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
     if action == "calibrate":
         return calibrate(job, data)
+
+    if action == "generate_long_project":
+        return generate_long_project(job, data)
 
     if action == "normalize_legal_text":
         original = str(data.get("text") or "")
@@ -1025,6 +1210,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 3.0...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 4.0...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
