@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import threading
 import urllib.request
+import difflib
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,11 @@ import runpod
 import torch
 import torchaudio
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -25,6 +32,8 @@ MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 *
 _MODEL: ChatterboxMultilingualTTS | None = None
 _MODEL_LOCK = threading.Lock()
 _GENERATION_LOCK = threading.Lock()
+_WHISPER = None
+_WHISPER_LOCK = threading.Lock()
 
 
 PROFILES: dict[str, dict[str, Any]] = {
@@ -396,10 +405,203 @@ def encode_output(path: Path) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+
+def get_whisper():
+    global _WHISPER
+    if WhisperModel is None:
+        return None
+    if _WHISPER is None:
+        with _WHISPER_LOCK:
+            if _WHISPER is None:
+                compute_type = "float16" if DEVICE == "cuda" else "int8"
+                _WHISPER = WhisperModel(
+                    os.getenv("CTEC_WHISPER_MODEL", "small"),
+                    device=DEVICE,
+                    compute_type=compute_type,
+                )
+    return _WHISPER
+
+
+def normalize_compare_text(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[^\w\sáàâãéêíóôõúüç]", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def transcription_similarity(expected: str, actual: str) -> float:
+    a = normalize_compare_text(expected)
+    b = normalize_compare_text(actual)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def transcribe_audio(path: Path) -> str:
+    model = get_whisper()
+    if model is None:
+        return ""
+    segments, _ = model.transcribe(
+        str(path),
+        language="pt",
+        beam_size=3,
+        vad_filter=True,
+    )
+    return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def analyze_reference_audio(path: Path) -> dict[str, Any]:
+    waveform, sample_rate = torchaudio.load(str(path))
+    mono = waveform.mean(dim=0)
+    duration = float(mono.numel() / sample_rate)
+    rms = float(torch.sqrt(torch.mean(mono ** 2) + 1e-9))
+    peak = float(torch.max(torch.abs(mono)))
+    frame = max(1, int(sample_rate * 0.03))
+    usable = mono[: (mono.numel() // frame) * frame]
+    if usable.numel() == 0:
+        silence_ratio = 0.0
+    else:
+        energies = torch.sqrt(
+            torch.mean(usable.reshape(-1, frame) ** 2, dim=1) + 1e-9
+        )
+        threshold = max(0.003, float(torch.median(energies)) * 0.22)
+        silence_ratio = float((energies < threshold).float().mean())
+    clipping_ratio = float((torch.abs(mono) >= 0.995).float().mean())
+    quality = 100.0
+    quality -= min(35.0, silence_ratio * 45.0)
+    quality -= min(30.0, clipping_ratio * 5000.0)
+    if duration < 6:
+        quality -= 25
+    if duration > 180:
+        quality -= 5
+    return {
+        "durationSeconds": round(duration, 2),
+        "sampleRate": sample_rate,
+        "rms": round(rms, 6),
+        "peak": round(peak, 6),
+        "silenceRatio": round(silence_ratio, 4),
+        "clippingRatio": round(clipping_ratio, 6),
+        "qualityScore": round(clamp(quality, 0, 100), 1),
+    }
+
+
+def write_generated_candidate(
+    model: ChatterboxMultilingualTTS,
+    text: str,
+    reference_path: Path,
+    settings: dict[str, Any],
+    destination: Path,
+) -> float:
+    audio = model.generate(
+        text,
+        language_id="pt",
+        audio_prompt_path=str(reference_path),
+        exaggeration=float(settings["exaggeration"]),
+        cfg_weight=float(settings["cfg_weight"]),
+        temperature=float(settings["temperature"]),
+        repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
+        min_p=float(settings.get("min_p", 0.05)),
+        top_p=float(settings.get("top_p", 0.95)),
+    ).detach().cpu()
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+    torchaudio.save(str(destination), audio, model.sr)
+    return float(audio.shape[1] / model.sr)
+
+
+def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    calibration_text = str(
+        data.get("calibration_text")
+        or "Artigo quinto. Todos são iguais perante a lei, sem distinção de qualquer natureza. Parágrafo primeiro. As normas definidoras dos direitos e garantias fundamentais têm aplicação imediata."
+    ).strip()
+    target_profile = str(data.get("target_profile") or "law_natural").strip()
+    base = dict(PROFILES.get(target_profile, PROFILES["law_natural"]))
+
+    candidates = [
+        {"name": "A", "exaggeration": 0.30, "cfg_weight": 0.68, "temperature": 0.46, "speed": 0.94},
+        {"name": "B", "exaggeration": 0.40, "cfg_weight": 0.60, "temperature": 0.54, "speed": 0.97},
+        {"name": "C", "exaggeration": 0.48, "cfg_weight": 0.52, "temperature": 0.62, "speed": 1.00},
+        {"name": "D", "exaggeration": 0.34, "cfg_weight": 0.72, "temperature": 0.40, "speed": 0.92},
+    ]
+
+    with _GENERATION_LOCK, tempfile.TemporaryDirectory(prefix="ctec_calibration_") as tmp:
+        root = Path(tmp)
+        reference_path = save_reference_audio(data, root)
+        reference_metrics = analyze_reference_audio(reference_path)
+        model = get_model()
+        results = []
+
+        for index, candidate in enumerate(candidates, start=1):
+            runpod.serverless.progress_update(
+                job, f"Calibração automática: teste {index} de {len(candidates)}"
+            )
+            settings = dict(base)
+            settings.update(candidate)
+            wav_path = root / f"candidate_{candidate['name']}.wav"
+            duration = write_generated_candidate(
+                model, calibration_text, reference_path, settings, wav_path
+            )
+            transcript = transcribe_audio(wav_path)
+            similarity = transcription_similarity(calibration_text, transcript)
+            expected_duration = max(2.0, len(calibration_text.split()) / 2.7)
+            duration_ratio = duration / expected_duration
+            rhythm_score = 1.0 - min(1.0, abs(duration_ratio - 1.0) / 0.55)
+            completeness = similarity
+            score = (
+                completeness * 72.0
+                + rhythm_score * 18.0
+                + (reference_metrics["qualityScore"] / 100.0) * 10.0
+            )
+            preview_mp3 = root / f"candidate_{candidate['name']}.mp3"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
+                    "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_mp3),
+                ],
+                check=True,
+            )
+            preview_b64 = base64.b64encode(preview_mp3.read_bytes()).decode("ascii")
+            results.append({
+                "name": candidate["name"],
+                "score": round(score, 1),
+                "completeness": round(completeness * 100, 1),
+                "rhythmStability": round(rhythm_score * 100, 1),
+                "durationSeconds": round(duration, 2),
+                "transcript": transcript,
+                "settings": settings,
+                "previewAudioBase64": preview_b64,
+                "previewMimeType": "audio/mpeg",
+            })
+
+        best = max(results, key=lambda item: item["score"])
+        best_settings = dict(best["settings"])
+        best_settings.update({
+            "stability": round(best["rhythmStability"] / 100.0, 3),
+            "voiceFidelity": round(clamp(
+                reference_metrics["qualityScore"] / 100.0, 0.55, 0.95
+            ), 3),
+            "cfgWeight": best_settings["cfg_weight"],
+            "commaPauseMs": 250 if target_profile != "law_formal" else 300,
+            "periodPauseMs": 520 if target_profile != "law_formal" else 620,
+            "paragraphPauseMs": 760 if target_profile != "law_formal" else 900,
+            "maxChunkCharacters": 500 if target_profile != "law_formal" else 430,
+        })
+        return {
+            "status": "ok",
+            "action": "calibrate",
+            "score": best["score"],
+            "completeness": best["completeness"],
+            "rhythmStability": best["rhythmStability"],
+            "recommendedSettings": best_settings,
+            "referenceMetrics": reference_metrics,
+            "bestCandidate": best["name"],
+            "candidates": results,
+        }
+
+
 def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
-        "worker": "CTEC Voz Neural",
+        "worker": "CTEC Estúdio de Voz",
         "version": "2.0.0",
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -416,6 +618,9 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
     if action in {"capabilities", "config", "health"}:
         return capabilities()
+
+    if action == "calibrate":
+        return calibrate(job, data)
 
     text = str(data.get("text") or "").strip()
     if len(text) < 3:
@@ -522,6 +727,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Voz Neural Worker 2.0...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 3.0...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
