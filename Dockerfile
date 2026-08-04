@@ -5,19 +5,17 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/root/.cache/huggingface \
-    CTEC_CHATTERBOX_MODEL=v3 \
     CTEC_WHISPER_MODEL=small \
-    CTEC_CHUNK_TARGET=250 \
-    CTEC_CHUNK_MAX=300 \
-    CTEC_MIN_SIMILARITY=0.92 \
-    CTEC_MIN_WORD_COVERAGE=0.94 \
-    CTEC_MAX_CHUNK_ATTEMPTS=3 \
-    CTEC_SEED_BASE=20260803
+    CTEC_MAX_TEXT_CHARS=120000 \
+    CTEC_MAX_REFERENCE_BYTES=31457280 \
+    CTEC_MAX_RESULT_BASE64_BYTES=14680064
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
         ffmpeg \
         git \
+        libgomp1 \
         libsndfile1 \
         rubberband-cli \
         sox \
