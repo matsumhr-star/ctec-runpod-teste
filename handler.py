@@ -992,12 +992,18 @@ def write_generated_candidate(
     settings: dict[str, Any],
     destination: Path,
 ) -> float:
+    # A calibração já possui sua própria etapa de transcrição e pontuação
+    # logo abaixo. Não deve usar a verificação rígida por chunk, pois isso
+    # pode impedir a calibração de concluir antes de comparar os candidatos.
+    calibration_settings = dict(settings)
+    calibration_settings["verify_each_chunk"] = False
+
     audio = generate_chunk_with_retry(
         model,
         text,
         language_id="pt",
         reference_path=reference_path,
-        settings=settings,
+        settings=calibration_settings,
         chunk_index=1,
         total_chunks=1,
     )
@@ -1132,7 +1138,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.2.0",
+        "version": "5.2.1",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -1153,6 +1159,7 @@ def capabilities() -> dict[str, Any]:
         "voice_consistency_mode": True,
         "punctuation_prosody_engine": True,
         "ui_pause_controls_applied_inside_chunks": True,
+        "calibration_uses_own_scoring": True,
     }
 
 
@@ -2029,6 +2036,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2.1...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
