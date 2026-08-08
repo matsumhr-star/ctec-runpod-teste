@@ -917,10 +917,36 @@ def get_whisper():
     return _WHISPER
 
 
+_VERIFICATION_NUMBER_WORDS = {
+    "zero": "0",
+    "um": "1", "uma": "1", "primeiro": "1", "primeira": "1",
+    "dois": "2", "duas": "2", "segundo": "2", "segunda": "2",
+    "três": "3", "tres": "3", "terceiro": "3", "terceira": "3",
+    "quatro": "4", "quarto": "4", "quarta": "4",
+    "cinco": "5", "quinto": "5", "quinta": "5",
+    "seis": "6", "sexto": "6", "sexta": "6",
+    "sete": "7", "sétimo": "7", "setimo": "7", "sétima": "7", "setima": "7",
+    "oito": "8", "oitavo": "8", "oitava": "8",
+    "nove": "9", "nono": "9", "nona": "9",
+    "dez": "10", "décimo": "10", "decimo": "10", "décima": "10", "decima": "10",
+}
+
+
 def normalize_compare_text(value: str) -> str:
-    value = value.lower()
+    value = str(value or "").lower()
+
+    # O Whisper frequentemente transcreve "um" como "1", "quinto" como "5",
+    # etc. Para verificação de conteúdo, essas formas são semanticamente iguais.
+    value = re.sub(r"(\d+)\s*[º°ª]", r"\1", value)
     value = re.sub(r"[^\w\sáàâãéêíóôõúüç]", " ", value, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\s+", " ", value).strip()
+
+    tokens = []
+    for token in value.split():
+        canonical = _VERIFICATION_NUMBER_WORDS.get(token, token)
+        tokens.append(canonical)
+
+    return " ".join(tokens)
 
 
 def transcription_similarity(expected: str, actual: str) -> float:
@@ -929,6 +955,40 @@ def transcription_similarity(expected: str, actual: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
+    """
+    Aceita diferenças apenas de representação numérica em estruturas jurídicas
+    curtas, por exemplo:
+      "Inciso um." == "Inciso 1."
+      "Artigo quinto." == "Artigo 5."
+      "Parágrafo primeiro." == "Parágrafo 1."
+    """
+    a = normalize_compare_text(expected)
+    b = normalize_compare_text(actual)
+    if not a or not b:
+        return False
+
+    if a == b:
+        return True
+
+    expected_tokens = a.split()
+    actual_tokens = b.split()
+
+    if len(expected_tokens) > 6 or len(actual_tokens) > 6:
+        return False
+
+    legal_heads = {
+        "artigo", "inciso", "parágrafo", "paragrafo",
+        "alínea", "alinea", "item"
+    }
+    if not expected_tokens or expected_tokens[0] not in legal_heads:
+        return False
+    if not actual_tokens or actual_tokens[0] not in legal_heads:
+        return False
+
+    return expected_tokens == actual_tokens
 
 
 def transcribe_audio(path: Path) -> str:
@@ -1138,7 +1198,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.2.1",
+        "version": "5.2.2",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -1160,6 +1220,7 @@ def capabilities() -> dict[str, Any]:
         "punctuation_prosody_engine": True,
         "ui_pause_controls_applied_inside_chunks": True,
         "calibration_uses_own_scoring": True,
+        "whisper_numeric_equivalence": True,
     }
 
 
@@ -1389,8 +1450,8 @@ def validate_chunk_integrity(
 
 
 def transcription_word_recall(expected: str, actual: str) -> float:
-    expected_words = _integrity_tokens(expected)
-    actual_words = _integrity_tokens(actual)
+    expected_words = normalize_compare_text(expected).split()
+    actual_words = normalize_compare_text(actual).split()
     if not expected_words or not actual_words:
         return 0.0
 
@@ -1528,7 +1589,13 @@ def generate_chunk_with_retry(
                 last_recall = recall
 
                 # Para evitar informação pulada, recall pesa mais que similaridade geral.
-                approved = (
+                # Estruturas jurídicas curtas podem ser transcritas pelo Whisper com
+                # algarismo em vez de palavra ("Inciso 1" x "Inciso um").
+                semantic_equivalent = legal_short_chunk_equivalent(
+                    candidate,
+                    transcript,
+                )
+                approved = semantic_equivalent or (
                     recall >= verify_threshold
                     and similarity >= max(0.78, verify_threshold - 0.08)
                 )
@@ -1539,6 +1606,7 @@ def generate_chunk_with_retry(
                     f"attempt={attempt_index} | "
                     f"similarity={similarity:.3f} | "
                     f"word_recall={recall:.3f} | "
+                    f"semantic_equivalent={str(semantic_equivalent).lower()} | "
                     f"approved={str(approved).lower()} | "
                     f"recognized={transcript[:180]!r}",
                     flush=True,
@@ -2036,6 +2104,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2.1...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2.2...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
