@@ -526,35 +526,197 @@ def save_reference_audio(data: dict[str, Any], root: Path) -> Path:
     )
 
 
-def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, Any]]:
-    """Decodifica e equilibra a amostra sem alterar o arquivo original."""
-    decoded = root / "reference_decoded.wav"
-    prepared = root / "reference_prepared.wav"
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
-            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(decoded),
-        ],
-        check=True,
+def _reference_window_score(segment: torch.Tensor, sample_rate: int) -> float:
+    """Pontua uma janela priorizando fala contínua, nível saudável e ausência de clipping."""
+    if segment.ndim > 1:
+        segment = segment.mean(dim=0)
+    if segment.numel() == 0 or sample_rate <= 0:
+        return -1e9
+
+    rms = float(torch.sqrt(torch.mean(segment ** 2) + 1e-9))
+    clipping_ratio = float((torch.abs(segment) >= 0.995).float().mean())
+
+    frame = max(1, int(sample_rate * 0.03))
+    usable = segment[: (segment.numel() // frame) * frame]
+    if usable.numel() == 0:
+        return -1e9
+
+    energies = torch.sqrt(
+        torch.mean(usable.reshape(-1, frame) ** 2, dim=1) + 1e-9
     )
-    metrics = analyze_reference_audio(decoded)
-    duration = float(metrics.get("durationSeconds") or 0)
-    if duration < 3:
+    threshold = max(0.003, float(torch.median(energies)) * 0.22)
+    silence_ratio = float((energies < threshold).float().mean())
+
+    # Penaliza silêncio, clipping e volume muito baixo/alto.
+    score = 100.0
+    score -= min(70.0, silence_ratio * 85.0)
+    score -= min(80.0, clipping_ratio * 12000.0)
+
+    if rms < 0.008:
+        score -= 45.0
+    elif rms < 0.015:
+        score -= 20.0
+    elif rms > 0.35:
+        score -= 25.0
+
+    return score
+
+
+def _select_reference_segment(
+    decoded: Path,
+    root: Path,
+    *,
+    target_seconds: float = 45.0,
+    max_seconds: float = 60.0,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    Para referências longas, escolhe automaticamente uma janela de fala útil.
+    O arquivo original/decodificado nunca é sobrescrito.
+    """
+    waveform, sample_rate = torchaudio.load(str(decoded))
+    if waveform.numel() == 0 or sample_rate <= 0:
+        raise ValueError("A amostra de voz está vazia ou corrompida.")
+
+    mono = waveform.mean(dim=0)
+    total_seconds = float(mono.numel() / sample_rate)
+
+    if total_seconds < 3.0:
         raise ValueError(
             "A amostra precisa ter pelo menos 3 segundos; use de 15 a 60 segundos."
         )
-    if duration > 300:
-        raise ValueError("A amostra não pode ultrapassar cinco minutos.")
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", str(decoded),
-            "-af",
-            "highpass=f=60,lowpass=f=11500,"
-            "loudnorm=I=-20:TP=-3:LRA=7",
-            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(prepared),
-        ],
-        check=True,
+
+    # Referências já curtas não precisam ser recortadas.
+    if total_seconds <= max_seconds:
+        return decoded, {
+            "reference_original_duration_sec": round(total_seconds, 2),
+            "reference_selected_duration_sec": round(total_seconds, 2),
+            "reference_segment_start_sec": 0.0,
+            "reference_was_trimmed": False,
+        }
+
+    target_seconds = float(clamp(target_seconds, 20.0, max_seconds))
+    target_samples = max(1, int(target_seconds * sample_rate))
+    edge_guard_seconds = 5.0
+    first_start = int(min(edge_guard_seconds, max(0.0, total_seconds * 0.05)) * sample_rate)
+    last_start = max(first_start, mono.numel() - target_samples - int(edge_guard_seconds * sample_rate))
+
+    # Avalia janelas a cada 5 s. Isso evita assumir que o melhor trecho está
+    # no começo e reduz a chance de pegar vinheta, silêncio ou encerramento.
+    step_samples = max(1, int(sample_rate * 5.0))
+    starts = list(range(first_start, last_start + 1, step_samples))
+    if last_start not in starts:
+        starts.append(last_start)
+
+    best_start = None
+    best_score = -1e9
+    for start in starts:
+        end = min(mono.numel(), start + target_samples)
+        segment = mono[start:end]
+        if segment.numel() < int(sample_rate * 20.0):
+            continue
+        score = _reference_window_score(segment, sample_rate)
+        if score > best_score:
+            best_score = score
+            best_start = start
+
+    if best_start is None:
+        raise ValueError("Não foi encontrada fala utilizável no áudio de referência.")
+
+    selected = root / "reference_selected.wav"
+    end = min(mono.numel(), best_start + target_samples)
+    selected_waveform = mono[best_start:end].unsqueeze(0)
+    torchaudio.save(str(selected), selected_waveform, sample_rate)
+
+    selected_seconds = float(selected_waveform.shape[1] / sample_rate)
+    if selected_seconds < 3.0:
+        raise ValueError("Não foi encontrada fala utilizável no áudio de referência.")
+
+    return selected, {
+        "reference_original_duration_sec": round(total_seconds, 2),
+        "reference_selected_duration_sec": round(selected_seconds, 2),
+        "reference_segment_start_sec": round(best_start / sample_rate, 2),
+        "reference_selection_score": round(best_score, 2),
+        "reference_was_trimmed": True,
+    }
+
+
+def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, Any]]:
+    """
+    Decodifica, seleciona uma amostra curta quando necessário e equilibra a
+    referência sem alterar o arquivo original.
+    """
+    decoded = root / "reference_decoded.wav"
+    prepared = root / "reference_prepared.wav"
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
+                "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(decoded),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "O áudio de referência está corrompido ou não pôde ser decodificado."
+        ) from exc
+
+    original_metrics = analyze_reference_audio(decoded)
+    original_duration = float(original_metrics.get("durationSeconds") or 0)
+
+    if original_duration < 3:
+        raise ValueError(
+            "A amostra precisa ter pelo menos 3 segundos; use de 15 a 60 segundos."
+        )
+
+    selected_source, selection_metrics = _select_reference_segment(
+        decoded,
+        root,
+        target_seconds=45.0,
+        max_seconds=60.0,
     )
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error", "-i", str(selected_source),
+                "-af",
+                "highpass=f=60,lowpass=f=11500,"
+                "loudnorm=I=-20:TP=-3:LRA=7",
+                "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(prepared),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(
+            "A amostra selecionada não pôde ser preparada para clonagem."
+        ) from exc
+
+    prepared_metrics = analyze_reference_audio(prepared)
+
+    # Mantém as métricas já usadas pelo restante do worker e acrescenta
+    # os campos de auditoria solicitados.
+    metrics = dict(prepared_metrics)
+    metrics.update(selection_metrics)
+    metrics["reference_original_path"] = str(source)
+    metrics["reference_prepared_path"] = str(prepared)
+    metrics["originalDurationSeconds"] = round(original_duration, 2)
+    metrics["selectedDurationSeconds"] = selection_metrics[
+        "reference_selected_duration_sec"
+    ]
+    metrics["wasTrimmed"] = selection_metrics["reference_was_trimmed"]
+
+    print(
+        "[CTEC] reference_original_duration_sec="
+        f"{metrics['reference_original_duration_sec']} | "
+        "reference_selected_duration_sec="
+        f"{metrics['reference_selected_duration_sec']} | "
+        f"reference_original_path={metrics['reference_original_path']} | "
+        f"reference_prepared_path={metrics['reference_prepared_path']} | "
+        f"reference_was_trimmed={str(metrics['reference_was_trimmed']).lower()}",
+        flush=True,
+    )
+
     return prepared, metrics
 
 
@@ -941,7 +1103,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.0.0",
+        "version": "5.0.1",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -1495,6 +1657,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.0...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.0.1...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
