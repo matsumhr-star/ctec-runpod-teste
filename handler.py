@@ -1132,7 +1132,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.1.0",
+        "version": "5.2.0",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -1151,6 +1151,8 @@ def capabilities() -> dict[str, Any]:
         "chunk_text_integrity": True,
         "per_chunk_whisper_verification": WhisperModel is not None,
         "voice_consistency_mode": True,
+        "punctuation_prosody_engine": True,
+        "ui_pause_controls_applied_inside_chunks": True,
     }
 
 
@@ -1180,6 +1182,90 @@ def pause_for_chunk(
     if paragraph_end:
         return int(settings["pause_paragraph_ms"])
     return int(settings["pause_sentence_ms"])
+
+
+
+def split_chunk_for_prosody(value: str) -> list[tuple[str, str]]:
+    """
+    Divide um chunk somente em pontos naturais de prosódia.
+    Retorna (texto_da_unidade, pontuacao_final).
+    A pontuação permanece no texto enviado ao TTS; ela não é narrada.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return []
+
+    # Mantém o delimitador para sabermos qual pausa aplicar depois.
+    parts = re.split(r"(?<=[,;:.!?])\s+", value)
+    units: list[tuple[str, str]] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        punctuation = part[-1] if part[-1] in ",;:.!?" else ""
+        units.append((part, punctuation))
+
+    return units
+
+
+def pause_for_punctuation(
+    punctuation: str,
+    *,
+    paragraph_end: bool,
+    settings: dict[str, Any],
+) -> int:
+    """
+    Usa exatamente os controles já existentes na interface:
+    vírgula, ponto, dois-pontos e parágrafo.
+    """
+    if paragraph_end:
+        return int(settings["pause_paragraph_ms"])
+
+    if punctuation == ",":
+        return int(settings["pause_comma_ms"])
+
+    if punctuation == ":":
+        return int(settings["pause_colon_ms"])
+
+    if punctuation == ";":
+        # Não há slider específico para ponto e vírgula.
+        # Usa uma pausa intermediária entre vírgula e dois-pontos.
+        return int(round(
+            (int(settings["pause_comma_ms"]) + int(settings["pause_colon_ms"])) / 2
+        ))
+
+    if punctuation in {".", "!", "?"}:
+        return int(settings["pause_sentence_ms"])
+
+    return 0
+
+
+def prosody_units_for_chunk(
+    chunk: str,
+    paragraph_end: bool,
+    settings: dict[str, Any],
+) -> list[tuple[str, int]]:
+    """
+    Converte um chunk em unidades narráveis e associa a pausa configurada
+    após cada unidade. A última unidade respeita a pausa de parágrafo.
+    """
+    units = split_chunk_for_prosody(chunk)
+    if not units:
+        return []
+
+    output: list[tuple[str, int]] = []
+    for index, (unit_text, punctuation) in enumerate(units):
+        is_last = index == len(units) - 1
+        pause_ms = pause_for_punctuation(
+            punctuation,
+            paragraph_end=paragraph_end and is_last,
+            settings=settings,
+        )
+        output.append((unit_text, pause_ms))
+
+    return output
 
 
 def is_valid_generation_chunk(value: str) -> bool:
@@ -1595,27 +1681,49 @@ def generate_long_project(
                 }),
             )
 
-            audio = generate_chunk_with_retry(
-                model,
-                chunk,
-                language_id=language_id,
-                reference_path=reference_path,
-                settings=settings,
-                chunk_index=index,
-                total_chunks=total,
-                verification_dir=root / "verification",
-            )
-            if audio.ndim == 1:
-                audio = audio.unsqueeze(0)
+            units = prosody_units_for_chunk(chunk, paragraph_end, settings)
+            if not units:
+                raise RuntimeError(
+                    f"O trecho {index}/{total} não gerou nenhuma unidade de prosódia."
+                )
+
+            chunk_segments: list[torch.Tensor] = []
+            for unit_number, (unit_text, internal_pause_ms) in enumerate(units, start=1):
+                audio_unit = generate_chunk_with_retry(
+                    model,
+                    unit_text,
+                    language_id=language_id,
+                    reference_path=reference_path,
+                    settings=settings,
+                    chunk_index=((index - 1) * 1000) + unit_number,
+                    total_chunks=max(total * 1000, ((index - 1) * 1000) + len(units)),
+                    verification_dir=root / "verification",
+                )
+                if audio_unit.ndim == 1:
+                    audio_unit = audio_unit.unsqueeze(0)
+                chunk_segments.append(audio_unit)
+
+                # Dentro do chunk, aplica vírgula/ponto/dois-pontos/parágrafo.
+                # A pausa da última unidade é tratada abaixo para evitar duplicação.
+                if unit_number < len(units) and internal_pause_ms > 0:
+                    chunk_segments.append(torch.zeros(
+                        1,
+                        int(model.sr * internal_pause_ms / 1000.0),
+                        dtype=torch.float32,
+                    ))
+
+            audio = torch.cat(chunk_segments, dim=1)
 
             wav_path = chunks_dir / f"{index:05d}.wav"
             mp3_path = chunks_dir / f"{index:05d}.mp3"
             torchaudio.save(str(wav_path), audio, model.sr)
 
+            # Última pausa do chunk vem da pontuação final / parágrafo.
+            final_unit_pause_ms = units[-1][1]
             pause_ms = (
                 int(settings["final_silence_ms"])
                 if index == total
-                else pause_for_chunk(chunk, paragraph_end, settings)
+                else final_unit_pause_ms
             )
             filters = []
             standard_filter = build_ffmpeg_filter(
@@ -1709,6 +1817,12 @@ def generate_long_project(
             "reference_used": True,
             "reference_path_hash": ref_hash,
             "voice_consistency_mode": settings["voice_consistency_mode"],
+            "punctuation_prosody": {
+                "comma_ms": settings["pause_comma_ms"],
+                "sentence_ms": settings["pause_sentence_ms"],
+                "colon_ms": settings["pause_colon_ms"],
+                "paragraph_ms": settings["pause_paragraph_ms"],
+            },
             "elapsed_seconds": int(time.time() - started),
         }
 
@@ -1808,28 +1922,44 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         segments: list[torch.Tensor] = []
         total = len(chunks)
 
+        # As pausas da interface agora são aplicadas dentro dos chunks,
+        # exatamente nos sinais de pontuação correspondentes.
+        prosody_total = sum(
+            len(prosody_units_for_chunk(chunk, paragraph_end, settings))
+            for chunk, paragraph_end in chunks
+        )
+        prosody_index = 0
+
         for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
             runpod.serverless.progress_update(job, f"Gerando trecho {index} de {total}")
             print(f"[CTEC] Gerando trecho {index}/{total}", flush=True)
 
-            audio = generate_chunk_with_retry(
-                model,
-                chunk,
-                language_id=language_id,
-                reference_path=reference_path,
-                settings=settings,
-                chunk_index=index,
-                total_chunks=total,
-                verification_dir=root / "verification",
-            )
+            units = prosody_units_for_chunk(chunk, paragraph_end, settings)
+            if not units:
+                raise RuntimeError(
+                    f"O trecho {index}/{total} não gerou nenhuma unidade de prosódia."
+                )
 
-            if audio.ndim == 1:
-                audio = audio.unsqueeze(0)
-            segments.append(audio)
+            for unit_text, pause_ms in units:
+                prosody_index += 1
+                audio = generate_chunk_with_retry(
+                    model,
+                    unit_text,
+                    language_id=language_id,
+                    reference_path=reference_path,
+                    settings=settings,
+                    chunk_index=prosody_index,
+                    total_chunks=prosody_total,
+                    verification_dir=root / "verification",
+                )
 
-            if index < total:
-                pause_ms = pause_for_chunk(chunk, paragraph_end, settings)
-                if pause_ms > 0:
+                if audio.ndim == 1:
+                    audio = audio.unsqueeze(0)
+                segments.append(audio)
+
+                # A pausa final global é adicionada pelo filtro de saída.
+                is_final_unit = prosody_index == prosody_total
+                if pause_ms > 0 and not is_final_unit:
                     segments.append(torch.zeros(
                         1,
                         int(model.sr * pause_ms / 1000.0),
@@ -1884,6 +2014,12 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
             "reference_used": True,
             "reference_path_hash": ref_hash,
             "voice_consistency_mode": settings["voice_consistency_mode"],
+            "punctuation_prosody": {
+                "comma_ms": settings["pause_comma_ms"],
+                "sentence_ms": settings["pause_sentence_ms"],
+                "colon_ms": settings["pause_colon_ms"],
+                "paragraph_ms": settings["pause_paragraph_ms"],
+            },
             "recognized_text": recognized_text,
             "transcription_similarity": round(
                 transcription_similarity(text, recognized_text) * 100,
@@ -1893,6 +2029,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.1...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
