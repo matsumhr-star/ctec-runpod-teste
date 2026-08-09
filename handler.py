@@ -567,8 +567,8 @@ def _select_reference_segment(
     decoded: Path,
     root: Path,
     *,
-    target_seconds: float = 45.0,
-    max_seconds: float = 60.0,
+    target_seconds: float = 22.0,
+    max_seconds: float = 30.0,
 ) -> tuple[Path, dict[str, Any]]:
     """
     Para referências longas, escolhe automaticamente uma janela de fala útil.
@@ -583,7 +583,7 @@ def _select_reference_segment(
 
     if total_seconds < 3.0:
         raise ValueError(
-            "A amostra precisa ter pelo menos 3 segundos; use de 15 a 60 segundos."
+            "A amostra precisa ter pelo menos 3 segundos; prefira de 15 a 30 segundos de fala limpa."
         )
 
     # Referências já curtas não precisam ser recortadas.
@@ -595,7 +595,7 @@ def _select_reference_segment(
             "reference_was_trimmed": False,
         }
 
-    target_seconds = float(clamp(target_seconds, 20.0, max_seconds))
+    target_seconds = float(clamp(target_seconds, 15.0, max_seconds))
     target_samples = max(1, int(target_seconds * sample_rate))
     edge_guard_seconds = 5.0
     first_start = int(min(edge_guard_seconds, max(0.0, total_seconds * 0.05)) * sample_rate)
@@ -613,7 +613,7 @@ def _select_reference_segment(
     for start in starts:
         end = min(mono.numel(), start + target_samples)
         segment = mono[start:end]
-        if segment.numel() < int(sample_rate * 20.0):
+        if segment.numel() < int(sample_rate * 15.0):
             continue
         score = _reference_window_score(segment, sample_rate)
         if score > best_score:
@@ -641,10 +641,16 @@ def _select_reference_segment(
     }
 
 
-def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, Any]]:
+def prepare_reference_audio(
+    source: Path,
+    root: Path,
+    settings: dict[str, Any] | None = None,
+) -> tuple[Path, dict[str, Any]]:
     """
-    Decodifica, seleciona uma amostra curta quando necessário e equilibra a
-    referência sem alterar o arquivo original.
+    Decodifica e seleciona uma amostra curta sem alterar o arquivo original.
+
+    No modo de clonagem fiel, preserva o espectro e a dinâmica da voz:
+    converte apenas para mono/24 kHz/PCM, sem loudnorm, highpass ou lowpass.
     """
     decoded = root / "reference_decoded.wav"
     prepared = root / "reference_prepared.wav"
@@ -667,27 +673,34 @@ def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, A
 
     if original_duration < 3:
         raise ValueError(
-            "A amostra precisa ter pelo menos 3 segundos; use de 15 a 60 segundos."
+            "A amostra precisa ter pelo menos 3 segundos; prefira de 15 a 30 segundos de fala limpa."
         )
+
+    fidelity_mode = bool((settings or {}).get("voice_clone_fidelity_mode", True))
 
     selected_source, selection_metrics = _select_reference_segment(
         decoded,
         root,
-        target_seconds=45.0,
-        max_seconds=60.0,
+        target_seconds=22.0 if fidelity_mode else 45.0,
+        max_seconds=30.0 if fidelity_mode else 60.0,
     )
 
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error", "-i", str(selected_source),
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(selected_source),
+        ]
+
+        if not fidelity_mode:
+            command += [
                 "-af",
                 "highpass=f=60,lowpass=f=11500,"
                 "loudnorm=I=-20:TP=-3:LRA=7",
-                "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(prepared),
-            ],
-            check=True,
-        )
+            ]
+
+        command += [
+            "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(prepared),
+        ]
+        subprocess.run(command, check=True)
     except subprocess.CalledProcessError as exc:
         raise ValueError(
             "A amostra selecionada não pôde ser preparada para clonagem."
@@ -706,6 +719,10 @@ def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, A
         "reference_selected_duration_sec"
     ]
     metrics["wasTrimmed"] = selection_metrics["reference_was_trimmed"]
+    metrics["voiceCloneFidelityMode"] = fidelity_mode
+    metrics["referenceProcessing"] = (
+        "format_only" if fidelity_mode else "filtered_and_normalized"
+    )
 
     print(
         "[CTEC] reference_original_duration_sec="
@@ -714,7 +731,9 @@ def prepare_reference_audio(source: Path, root: Path) -> tuple[Path, dict[str, A
         f"{metrics['reference_selected_duration_sec']} | "
         f"reference_original_path={metrics['reference_original_path']} | "
         f"reference_prepared_path={metrics['reference_prepared_path']} | "
-        f"reference_was_trimmed={str(metrics['reference_was_trimmed']).lower()}",
+        f"reference_was_trimmed={str(metrics['reference_was_trimmed']).lower()} | "
+        f"voice_clone_fidelity_mode={str(fidelity_mode).lower()} | "
+        f"reference_processing={metrics['referenceProcessing']}",
         flush=True,
     )
 
@@ -736,6 +755,7 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
 
     # Consistência e integridade do áudio.
     base.setdefault("voice_consistency_mode", True)
+    base.setdefault("voice_clone_fidelity_mode", True)
     base.setdefault("verify_each_chunk", True)
     base.setdefault("chunk_verify_threshold", 0.90)
     base.setdefault("chunk_verify_attempts", 3)
@@ -776,6 +796,7 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
         "preserve_complete_sentences",
         "split_by_legal_structure",
         "voice_consistency_mode",
+        "voice_clone_fidelity_mode",
         "verify_each_chunk",
     ):
         if key in data:
@@ -799,8 +820,17 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
     ):
         base[key] = int(base[key])
 
-    # Modo de consistência: fixa parâmetros-base para todos os chunks.
-    if base.get("voice_consistency_mode"):
+    # Modo de clonagem fiel: prioriza a identidade da referência e reduz
+    # aleatoriedade/expressividade que podem afastar o timbre do original.
+    if base.get("voice_clone_fidelity_mode"):
+        base["stability"] = max(float(base.get("stability", 0.72)), 0.94)
+        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.97)
+        base["temperature"] = min(float(base.get("temperature", 0.78)), 0.46)
+        base["exaggeration"] = min(float(base.get("exaggeration", 0.48)), 0.30)
+        base["cfg_weight"] = max(float(base.get("cfg_weight", 0.50)), 0.70)
+
+    # Consistência continua ativa para manter o mesmo perfil em todos os chunks.
+    elif base.get("voice_consistency_mode"):
         base["stability"] = max(float(base.get("stability", 0.72)), 0.90)
         base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.93)
         base["temperature"] = min(float(base.get("temperature", 0.78)), 0.58)
@@ -840,6 +870,7 @@ def public_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "pitch_semitones": settings["pitch_semitones"],
         "gain_db": settings["gain_db"],
         "voiceConsistencyMode": settings["voice_consistency_mode"],
+        "voiceCloneFidelityMode": settings["voice_clone_fidelity_mode"],
         "verifyEachChunk": settings["verify_each_chunk"],
         "chunkVerifyThreshold": settings["chunk_verify_threshold"],
         "chunkVerifyAttempts": settings["chunk_verify_attempts"],
@@ -957,6 +988,44 @@ def transcription_similarity(expected: str, actual: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
+def _roman_token_to_number(token: str) -> str:
+    raw = str(token or "").strip().upper()
+    if not raw or not re.fullmatch(r"[IVXLCDM]+", raw):
+        return str(token or "")
+    value = roman_to_int(raw)
+    return str(value) if value > 0 else str(token or "")
+
+
+def normalize_legal_verification_text(value: str) -> str:
+    """
+    Normalização apenas para conferência do Whisper.
+    Considera equivalentes:
+      Título I == Título 1
+      Capítulo IV == Capítulo 4
+      Seção II == Seção 2
+      Inciso I == Inciso 1
+    sem alterar o texto narrado.
+    """
+    normalized = normalize_compare_text(value)
+    tokens = normalized.split()
+    legal_heads = {
+        "título", "titulo", "capítulo", "capitulo", "seção", "secao",
+        "subseção", "subsecao", "livro", "parte",
+        "artigo", "inciso", "parágrafo", "paragrafo", "alínea", "alinea", "item"
+    }
+
+    output = []
+    previous = ""
+    for token in tokens:
+        current = token
+        if previous in legal_heads and re.fullmatch(r"[ivxlcdm]+", token, flags=re.IGNORECASE):
+            current = _roman_token_to_number(token)
+        output.append(current)
+        previous = current.lower()
+
+    return " ".join(output)
+
+
 def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
     """
     Aceita diferenças apenas de representação numérica em estruturas jurídicas
@@ -965,8 +1034,8 @@ def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
       "Artigo quinto." == "Artigo 5."
       "Parágrafo primeiro." == "Parágrafo 1."
     """
-    a = normalize_compare_text(expected)
-    b = normalize_compare_text(actual)
+    a = normalize_legal_verification_text(expected)
+    b = normalize_legal_verification_text(actual)
     if not a or not b:
         return False
 
@@ -981,7 +1050,10 @@ def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
 
     legal_heads = {
         "artigo", "inciso", "parágrafo", "paragrafo",
-        "alínea", "alinea", "item"
+        "alínea", "alinea", "item",
+        "título", "titulo", "capítulo", "capitulo",
+        "seção", "secao", "subseção", "subsecao",
+        "livro", "parte"
     }
     if not expected_tokens or expected_tokens[0] not in legal_heads:
         return False
@@ -1118,6 +1190,7 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
         reference_path, reference_metrics = prepare_reference_audio(
             reference_source,
             root,
+            base,
         )
         model = get_model()
         results = []
@@ -1198,7 +1271,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.2.2",
+        "version": "5.3.1",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {MODEL_VERSION}",
@@ -1217,6 +1290,9 @@ def capabilities() -> dict[str, Any]:
         "chunk_text_integrity": True,
         "per_chunk_whisper_verification": WhisperModel is not None,
         "voice_consistency_mode": True,
+        "voice_clone_fidelity_mode": True,
+        "reference_identity_preservation": True,
+        "whisper_roman_heading_equivalence": True,
         "punctuation_prosody_engine": True,
         "ui_pause_controls_applied_inside_chunks": True,
         "calibration_uses_own_scoring": True,
@@ -1503,6 +1579,7 @@ def generate_chunk_with_retry(
         )
 
     consistency_mode = bool(settings.get("voice_consistency_mode", True))
+    fidelity_mode = bool(settings.get("voice_clone_fidelity_mode", True))
     verify_each_chunk = bool(settings.get("verify_each_chunk", True))
     verify_threshold = float(settings.get("chunk_verify_threshold", 0.90))
     max_attempts = int(settings.get("chunk_verify_attempts", 3))
@@ -1510,7 +1587,13 @@ def generate_chunk_with_retry(
     stability = float(settings.get("stability", 0.90))
     fidelity = float(settings.get("voice_fidelity", 0.93))
 
-    if consistency_mode:
+    if fidelity_mode:
+        # Clonagem fiel: reduz variação e exagero para a referência acústica
+        # exercer mais influência sobre o resultado.
+        effective_temperature = min(float(settings["temperature"]), 0.46)
+        effective_exaggeration = min(float(settings["exaggeration"]), 0.30)
+        effective_cfg = max(float(settings["cfg_weight"]), 0.70)
+    elif consistency_mode:
         # Mesmos parâmetros em todas as tentativas/chunks.
         effective_temperature = min(float(settings["temperature"]), 0.58)
         effective_exaggeration = min(float(settings["exaggeration"]), 0.42)
@@ -1550,7 +1633,11 @@ def generate_chunk_with_retry(
 
             print(
                 f"[CTEC] Trecho {chunk_index}/{total_chunks}, "
-                f"tentativa {attempt_index}/{max_attempts}: {candidate[:180]!r}",
+                f"tentativa {attempt_index}/{max_attempts}: {candidate[:180]!r} | "
+                f"fidelity_mode={str(fidelity_mode).lower()} | "
+                f"temperature={effective_temperature:.3f} | "
+                f"exaggeration={effective_exaggeration:.3f} | "
+                f"cfg={effective_cfg:.3f}",
                 flush=True,
             )
 
@@ -1581,8 +1668,18 @@ def generate_chunk_with_retry(
                 torchaudio.save(str(verify_path), audio, model.sr)
 
                 transcript = transcribe_audio(verify_path)
-                similarity = transcription_similarity(candidate, transcript)
-                recall = transcription_word_recall(candidate, transcript)
+
+                verify_expected = normalize_legal_verification_text(candidate)
+                verify_actual = normalize_legal_verification_text(transcript)
+
+                similarity = transcription_similarity(
+                    verify_expected,
+                    verify_actual,
+                )
+                recall = transcription_word_recall(
+                    verify_expected,
+                    verify_actual,
+                )
 
                 last_transcript = transcript
                 last_similarity = similarity
@@ -1725,7 +1822,11 @@ def generate_long_project(
     ) as tmp:
         root = Path(tmp)
         reference_source = save_reference_audio(data, root)
-        reference_path, reference_metrics = prepare_reference_audio(reference_source, root)
+        reference_path, reference_metrics = prepare_reference_audio(
+            reference_source,
+            root,
+            settings,
+        )
         ref_hash = reference_path_hash(reference_path)
         print(
             f"[CTEC] reference_used=true | reference_path_hash={ref_hash} | "
@@ -1984,6 +2085,7 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         reference_path, reference_metrics = prepare_reference_audio(
             reference_source,
             root,
+            settings,
         )
         ref_hash = reference_path_hash(reference_path)
         print(
@@ -2104,6 +2206,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.2.2...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.3.1...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
