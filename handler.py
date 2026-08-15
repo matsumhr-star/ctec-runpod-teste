@@ -1,4 +1,5 @@
 import base64
+import inspect
 import json
 import math
 import os
@@ -12,6 +13,7 @@ import urllib.parse
 import difflib
 import statistics
 import hashlib
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 *
 WORKER_CONTRACT_VERSION = 2
 
 _MODEL: ChatterboxMultilingualTTS | None = None
+_LOADED_MODEL_VERSION: str | None = None
 _MODEL_LOCK = threading.Lock()
 _GENERATION_LOCK = threading.Lock()
 _WHISPER = None
@@ -203,16 +206,26 @@ def load_voice_library() -> dict[str, str]:
 
 
 def get_model() -> ChatterboxMultilingualTTS:
-    global _MODEL
+    global _MODEL, _LOADED_MODEL_VERSION
     if _MODEL is None:
         with _MODEL_LOCK:
             if _MODEL is None:
+                loader_signature = inspect.signature(
+                    ChatterboxMultilingualTTS.from_pretrained
+                )
+                loader_kwargs: dict[str, Any] = {"device": DEVICE}
+                if "t3_model" in loader_signature.parameters:
+                    loader_kwargs["t3_model"] = MODEL_VERSION
+                    _LOADED_MODEL_VERSION = MODEL_VERSION
+                else:
+                    _LOADED_MODEL_VERSION = "default-compatible"
                 print(
-                    f"[CTEC] Carregando Chatterbox Multilingual {MODEL_VERSION} em {DEVICE}...",
+                    "[CTEC] Carregando Chatterbox Multilingual "
+                    f"({_LOADED_MODEL_VERSION}) em {DEVICE}...",
                     flush=True,
                 )
                 _MODEL = ChatterboxMultilingualTTS.from_pretrained(
-                    device=DEVICE,
+                    **loader_kwargs,
                 )
                 print("[CTEC] Modelo carregado com sucesso.", flush=True)
     return _MODEL
@@ -366,11 +379,22 @@ def normalize_law_text(
         text,
     )
 
-    text = re.sub(r"\s*;\s*", ";\n", text)
-    text = re.sub(r"\s*:\s*", ":\n", text)
-    text = re.sub(r"\s*[—–]\s*", ". ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Mantém a oração inteira dentro do mesmo contexto acústico. Antes, cada
+    # dois-pontos/ponto e vírgula virava nova linha e reiniciava a interpretação.
+    text = re.sub(r"\s*;\s*", "; ", text)
+    text = re.sub(r"\s*:\s*", ": ", text)
+    text = re.sub(r"\s*[—–]\s*", " — ", text)
     text = re.sub(r" +([,.;:])", r"\1", text)
+    return collapse_soft_line_breaks(text)
+
+
+def collapse_soft_line_breaks(text: str) -> str:
+    """Une linhas visuais de PDF e conserva somente parágrafos verdadeiros."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]*\n[ \t]*\n(?:[ \t]*\n)*[ \t]*", "\n\n", text)
+    text = re.sub(r"(?<!\n)[ \t]*\n[ \t]*(?!\n)", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -381,7 +405,9 @@ def prepare_text(text: str, mode: str, custom_dictionary=None) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if mode == "law":
         text = normalize_law_text(text, custom_dictionary)
-    return text
+    else:
+        text = collapse_soft_line_breaks(text)
+    return text.strip()
 
 
 def split_long_unit(value: str, limit: int) -> list[str]:
@@ -427,45 +453,68 @@ def split_text(
     preserve_complete_sentences: bool = True,
     split_by_legal_structure: bool = True,
     context_margin_words: int = 0,
+    target: int | None = None,
 ) -> list[tuple[str, bool]]:
-    """Retorna (trecho, fim_de_paragrafo) sem perder nem repetir palavras."""
-    margin = int(clamp(context_margin_words, 0, 20)) * 7
-    effective_limit = max(100, int(limit) - margin)
-    source = text if split_by_legal_structure else re.sub(r"\s*\n+\s*", " ", text)
-    paragraphs = [p.strip() for p in re.split(r"\n+", source) if p.strip()]
-    chunks: list[tuple[str, bool]] = []
+    """Agrupa várias frases relacionadas em uma única chamada ao TTS."""
+    # Mantido no contrato por compatibilidade. Sobreposição real repetiria
+    # palavras no áudio e, portanto, não é aplicada.
+    _ = context_margin_words
+    effective_limit = max(120, int(limit))
+    target_limit = int(target or min(300, effective_limit))
+    target_limit = int(clamp(target_limit, 120, effective_limit))
 
+    source = collapse_soft_line_breaks(text)
+    if not split_by_legal_structure:
+        source = re.sub(r"\s*\n{2,}\s*", " ", source)
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", source) if p.strip()]
+
+    units: list[tuple[str, bool]] = []
     for paragraph in paragraphs:
         sentences = (
-            re.split(r"(?<=[.!?;:])\s+", paragraph)
+            re.split(r"(?<=[.!?])\s+", paragraph)
             if preserve_complete_sentences
             else [paragraph]
         )
-        current = ""
-        local: list[str] = []
-
+        sentences = [item.strip() for item in sentences if item.strip()]
+        expanded: list[str] = []
         for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
             if len(sentence) > effective_limit:
-                if current:
-                    local.append(current)
-                    current = ""
-                local.extend(split_long_unit(sentence, effective_limit))
-                continue
-            candidate = f"{current} {sentence}".strip()
-            if current and len(candidate) > effective_limit:
-                local.append(current)
-                current = sentence
+                expanded.extend(split_long_unit(sentence, effective_limit))
             else:
-                current = candidate
+                expanded.append(sentence)
+        for index, sentence in enumerate(expanded):
+            units.append((sentence, index == len(expanded) - 1))
 
+    chunks: list[tuple[str, bool]] = []
+    current = ""
+    current_end = False
+    current_units = 0
+
+    def flush() -> None:
+        nonlocal current, current_end, current_units
         if current:
-            local.append(current)
-        for index, item in enumerate(local):
-            chunks.append((item, index == len(local) - 1))
+            chunks.append((current.strip(), current_end))
+        current = ""
+        current_end = False
+        current_units = 0
 
+    for unit, paragraph_end in units:
+        candidate = f"{current} {unit}".strip()
+        exceeds_limit = bool(current) and len(candidate) > effective_limit
+        reached_target = (
+            bool(current)
+            and current_units >= 2
+            and len(current) >= target_limit
+            and len(candidate) > target_limit
+        )
+        if exceeds_limit or reached_target:
+            flush()
+            candidate = unit
+        current = candidate
+        current_end = paragraph_end
+        current_units += 1
+
+    flush()
     return chunks
 
 
@@ -747,9 +796,13 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
     base.setdefault("voice_fidelity", 0.78)
     base.setdefault("pause_comma_ms", 250)
     base.setdefault("pause_colon_ms", 380)
+    base.setdefault("pause_continuation_ms", 110)
     base.setdefault("initial_silence_ms", 180)
     base.setdefault("final_silence_ms", 260)
-    base.setdefault("chunk_overlap_words", 8)
+    base.setdefault("chunk_overlap_words", 0)
+    base.setdefault("chunk_target", 260)
+    base.setdefault("edge_silence_keep_ms", 45)
+    base.setdefault("seam_fade_ms", 12)
     base.setdefault("preserve_complete_sentences", True)
     base.setdefault("split_by_legal_structure", True)
 
@@ -773,9 +826,13 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
         "pause_paragraph_ms": (0, 5000),
         "pause_comma_ms": (0, 1200),
         "pause_colon_ms": (0, 1600),
+        "pause_continuation_ms": (0, 600),
         "initial_silence_ms": (0, 2000),
         "final_silence_ms": (0, 3000),
         "chunk_overlap_words": (0, 20),
+        "chunk_target": (120, 500),
+        "edge_silence_keep_ms": (20, 120),
+        "seam_fade_ms": (2, 30),
         "stability": (0.0, 1.0),
         "voice_fidelity": (0.0, 1.0),
         "chunk_verify_threshold": (0.70, 0.99),
@@ -812,22 +869,27 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
         "pause_paragraph_ms",
         "pause_comma_ms",
         "pause_colon_ms",
+        "pause_continuation_ms",
         "initial_silence_ms",
         "final_silence_ms",
         "chunk_overlap_words",
+        "chunk_target",
+        "edge_silence_keep_ms",
+        "seam_fade_ms",
         "chunk_verify_attempts",
         "voice_seed",
     ):
         base[key] = int(base[key])
+    base["chunk_target"] = min(base["chunk_target"], base["chunk_limit"])
 
     # Modo de clonagem fiel: prioriza a identidade da referência e reduz
     # aleatoriedade/expressividade que podem afastar o timbre do original.
     if base.get("voice_clone_fidelity_mode"):
-        base["stability"] = max(float(base.get("stability", 0.72)), 0.94)
-        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.97)
-        base["temperature"] = min(float(base.get("temperature", 0.78)), 0.46)
-        base["exaggeration"] = min(float(base.get("exaggeration", 0.48)), 0.30)
-        base["cfg_weight"] = max(float(base.get("cfg_weight", 0.50)), 0.70)
+        base["stability"] = max(float(base.get("stability", 0.72)), 0.90)
+        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.94)
+        base["temperature"] = min(float(base.get("temperature", 0.78)), 0.56)
+        base["exaggeration"] = min(float(base.get("exaggeration", 0.48)), 0.40)
+        base["cfg_weight"] = max(float(base.get("cfg_weight", 0.50)), 0.62)
 
     # Consistência continua ativa para manter o mesmo perfil em todos os chunks.
     elif base.get("voice_consistency_mode"):
@@ -858,10 +920,14 @@ def public_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "pause_paragraph_ms": settings["pause_paragraph_ms"],
         "commaPauseMs": settings["pause_comma_ms"],
         "colonPauseMs": settings["pause_colon_ms"],
+        "continuationPauseMs": settings["pause_continuation_ms"],
         "initialSilenceMs": settings["initial_silence_ms"],
         "finalSilenceMs": settings["final_silence_ms"],
         "chunk_limit": settings["chunk_limit"],
+        "chunkTarget": settings["chunk_target"],
         "chunkOverlapWords": settings["chunk_overlap_words"],
+        "edgeSilenceKeepMs": settings["edge_silence_keep_ms"],
+        "seamFadeMs": settings["seam_fade_ms"],
         "preserveCompleteSentences": settings["preserve_complete_sentences"],
         "splitByLegalStructure": settings["split_by_legal_structure"],
         "text_mode": settings["text_mode"],
@@ -929,6 +995,21 @@ def encode_output(path: Path) -> str:
             "Divida o texto ou integre o worker ao Firebase Storage."
         )
     return base64.b64encode(raw).decode("ascii")
+
+
+def probe_audio_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return float(result.stdout.strip())
 
 
 
@@ -1247,10 +1328,12 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
                 reference_metrics["qualityScore"] / 100.0, 0.55, 0.95
             ), 3),
             "cfgWeight": best_settings["cfg_weight"],
-            "commaPauseMs": 250 if target_profile != "law_formal" else 300,
-            "periodPauseMs": 520 if target_profile != "law_formal" else 620,
-            "paragraphPauseMs": 760 if target_profile != "law_formal" else 900,
-            "maxChunkCharacters": 500 if target_profile != "law_formal" else 430,
+            "commaPauseMs": 110 if target_profile != "law_formal" else 130,
+            "periodPauseMs": 220 if target_profile != "law_formal" else 260,
+            "paragraphPauseMs": 430 if target_profile != "law_formal" else 520,
+            "continuationPauseMs": 100,
+            "maxChunkCharacters": 300,
+            "chunkTargetCharacters": 260,
         })
         return {
             "status": "ok",
@@ -1268,13 +1351,23 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
 
 
 def capabilities() -> dict[str, Any]:
+    loader_signature = inspect.signature(
+        ChatterboxMultilingualTTS.from_pretrained
+    )
+    supports_explicit_model = "t3_model" in loader_signature.parameters
+    effective_model = (
+        _LOADED_MODEL_VERSION
+        or (MODEL_VERSION if supports_explicit_model else "default-compatible")
+    )
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.3.1",
+        "version": "5.4.0",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
-        "model": f"Chatterbox Multilingual {MODEL_VERSION}",
+        "model": f"Chatterbox Multilingual {effective_model}",
+        "requested_model_version": MODEL_VERSION,
+        "explicit_model_selection": supports_explicit_model,
         "profiles": PROFILES,
         "supported_languages": sorted(SUPPORTED_LANGUAGES),
         "reference_inputs": ["voice_id", "reference_audio_url", "reference_audio_base64"],
@@ -1287,6 +1380,10 @@ def capabilities() -> dict[str, Any]:
         "long_projects": True,
         "punctuation_pauses": True,
         "reference_audio_balancing": True,
+        "semantic_chunks": True,
+        "adaptive_pauses": True,
+        "pcm_assembly": True,
+        "single_final_encoding": True,
         "chunk_text_integrity": True,
         "per_chunk_whisper_verification": WhisperModel is not None,
         "voice_consistency_mode": True,
@@ -1325,7 +1422,173 @@ def pause_for_chunk(
         return int(settings["pause_colon_ms"])
     if paragraph_end:
         return int(settings["pause_paragraph_ms"])
-    return int(settings["pause_sentence_ms"])
+    return int(settings.get("pause_continuation_ms", 110))
+
+
+def prepare_audio_for_join(
+    audio: torch.Tensor,
+    sample_rate: int,
+    settings: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apara apenas excesso de silêncio e protege os fonemas das bordas."""
+    audio = audio.detach().cpu().float()
+    while audio.ndim > 2 and audio.shape[0] == 1:
+        audio = audio.squeeze(0)
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)
+    if audio.ndim != 2:
+        raise RuntimeError(f"Formato inesperado do áudio gerado: {tuple(audio.shape)}")
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    audio = torch.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0)
+    audio = audio.clamp(-1.0, 1.0).contiguous()
+
+    if audio.shape[1] < max(1, int(sample_rate * 0.08)):
+        raise RuntimeError("O modelo devolveu um trecho curto demais para ser válido.")
+
+    samples = audio[0].abs()
+    peak = float(samples.max().item())
+    if peak < 1e-4:
+        raise RuntimeError("O modelo devolveu um trecho sem fala audível.")
+    threshold = max(0.0015, peak * 0.012)
+    active = torch.nonzero(samples > threshold, as_tuple=False).flatten()
+    if active.numel() == 0:
+        raise RuntimeError("Não foi possível localizar fala no trecho gerado.")
+
+    leading_samples = int(active[0].item())
+    trailing_samples = int(samples.numel() - 1 - active[-1].item())
+    keep_samples = max(
+        1,
+        int(sample_rate * int(settings.get("edge_silence_keep_ms", 45)) / 1000),
+    )
+    cut_start = max(0, leading_samples - keep_samples)
+    cut_end = max(0, trailing_samples - keep_samples)
+    end_index = audio.shape[1] - cut_end if cut_end else audio.shape[1]
+    if end_index - cut_start >= int(sample_rate * 0.08):
+        audio = audio[:, cut_start:end_index].contiguous()
+
+    samples = audio[0].abs()
+    active = torch.nonzero(samples > threshold, as_tuple=False).flatten()
+    leading_samples = int(active[0].item())
+    trailing_samples = int(samples.numel() - 1 - active[-1].item())
+
+    configured_fade = max(
+        1,
+        int(sample_rate * int(settings.get("seam_fade_ms", 12)) / 1000),
+    )
+    emergency_fade = max(1, int(sample_rate * 0.003))
+    fade_in = min(
+        configured_fade if leading_samples >= configured_fade else emergency_fade,
+        audio.shape[1] // 2,
+    )
+    fade_out = min(
+        configured_fade if trailing_samples >= configured_fade else emergency_fade,
+        audio.shape[1] // 2,
+    )
+    if fade_in > 0:
+        audio[:, :fade_in] *= torch.linspace(0.0, 1.0, fade_in)
+    if fade_out > 0:
+        audio[:, -fade_out:] *= torch.linspace(1.0, 0.0, fade_out)
+
+    return audio, {
+        "leadingSilenceMs": leading_samples * 1000.0 / sample_rate,
+        "trailingSilenceMs": trailing_samples * 1000.0 / sample_rate,
+        "trimmedStartMs": cut_start * 1000.0 / sample_rate,
+        "trimmedEndMs": cut_end * 1000.0 / sample_rate,
+        "peak": peak,
+    }
+
+
+class ContinuousWaveAssembler:
+    """Monta um único WAV/PCM progressivo, sem MP3 entre os blocos."""
+
+    def __init__(
+        self,
+        path: Path,
+        sample_rate: int,
+        settings: dict[str, Any],
+    ) -> None:
+        self.path = path
+        self.sample_rate = int(sample_rate)
+        self.settings = settings
+        self.total_samples = 0
+        self.chunk_count = 0
+        self.previous_chunk = ""
+        self.previous_paragraph_end = False
+        self.previous_trailing_ms = 0.0
+        self._closed = False
+        self._writer = wave.open(str(path), "wb")
+        self._writer.setnchannels(1)
+        self._writer.setsampwidth(2)
+        self._writer.setframerate(self.sample_rate)
+
+    def _write_silence(self, milliseconds: float) -> int:
+        sample_count = max(0, int(round(self.sample_rate * milliseconds / 1000.0)))
+        if sample_count:
+            self._writer.writeframesraw(b"\x00\x00" * sample_count)
+            self.total_samples += sample_count
+        return sample_count
+
+    def _write_audio(self, audio: torch.Tensor) -> int:
+        pcm = (audio[0].clamp(-1.0, 1.0) * 32767.0).round().to(torch.int16)
+        self._writer.writeframesraw(pcm.contiguous().numpy().tobytes())
+        sample_count = int(pcm.numel())
+        self.total_samples += sample_count
+        return sample_count
+
+    def add(
+        self,
+        audio: torch.Tensor,
+        chunk: str,
+        paragraph_end: bool,
+    ) -> dict[str, float]:
+        prepared, metrics = prepare_audio_for_join(
+            audio,
+            self.sample_rate,
+            self.settings,
+        )
+        leading_ms = metrics["leadingSilenceMs"]
+        if self.chunk_count == 0:
+            desired_pause_ms = float(self.settings.get("initial_silence_ms", 0))
+            existing_pause_ms = leading_ms
+        else:
+            desired_pause_ms = float(pause_for_chunk(
+                self.previous_chunk,
+                self.previous_paragraph_end,
+                self.settings,
+            ))
+            existing_pause_ms = self.previous_trailing_ms + leading_ms
+
+        inserted_pause_ms = max(0.0, desired_pause_ms - existing_pause_ms)
+        self._write_silence(inserted_pause_ms)
+        start_sample = self.total_samples
+        audio_samples = self._write_audio(prepared)
+
+        self.chunk_count += 1
+        self.previous_chunk = chunk
+        self.previous_paragraph_end = paragraph_end
+        self.previous_trailing_ms = metrics["trailingSilenceMs"]
+        metrics.update({
+            "insertedPauseMs": inserted_pause_ms,
+            "startSample": float(start_sample),
+            "audioSamples": float(audio_samples),
+        })
+        return metrics
+
+    def close(self, add_final_silence: bool = True) -> None:
+        if self._closed:
+            return
+        if add_final_silence and self.chunk_count:
+            desired_ms = float(self.settings.get("final_silence_ms", 0))
+            self._write_silence(max(0.0, desired_ms - self.previous_trailing_ms))
+        self._writer.close()
+        self._closed = True
+
+    def __enter__(self) -> "ContinuousWaveAssembler":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close(add_final_silence=exc_type is None)
 
 
 
@@ -1420,7 +1683,8 @@ def is_valid_generation_chunk(value: str) -> bool:
 
 def merge_tiny_chunks(
     chunks: list[tuple[str, bool]],
-    minimum_chars: int = 18,
+    minimum_chars: int = 70,
+    maximum_chars: int = 320,
 ) -> list[tuple[str, bool]]:
     """
     Junta trechos pequenos sem descartar conteúdo textual.
@@ -1428,6 +1692,7 @@ def merge_tiny_chunks(
     """
     merged: list[tuple[str, bool]] = []
     pending = ""
+    pending_end = False
 
     for raw_chunk, paragraph_end in chunks:
         chunk = clean_generation_chunk(raw_chunk)
@@ -1437,28 +1702,43 @@ def merge_tiny_chunks(
             continue
 
         if len(chunk) < minimum_chars:
-            pending = f"{pending} {chunk}".strip()
-            if paragraph_end and pending:
-                if merged:
-                    previous, _ = merged.pop()
-                    merged.append((f"{previous} {pending}".strip(), True))
-                else:
-                    merged.append((pending, True))
+            if merged:
+                previous, previous_end = merged[-1]
+                candidate = f"{previous} {chunk}".strip()
+                if len(candidate) <= maximum_chars:
+                    merged[-1] = (candidate, paragraph_end or previous_end)
+                    continue
+            candidate = f"{pending} {chunk}".strip()
+            if pending and len(candidate) > maximum_chars:
+                merged.append((pending, pending_end))
                 pending = ""
+            pending = f"{pending} {chunk}".strip()
+            pending_end = paragraph_end
             continue
 
         if pending:
-            chunk = f"{pending} {chunk}".strip()
+            candidate = f"{pending} {chunk}".strip()
+            if len(candidate) <= maximum_chars:
+                chunk = candidate
+                paragraph_end = paragraph_end or pending_end
+            else:
+                merged.append((pending, pending_end))
             pending = ""
+            pending_end = False
 
         merged.append((chunk, paragraph_end))
 
     if pending:
         if merged:
             previous, paragraph_end = merged.pop()
-            merged.append((f"{previous} {pending}".strip(), paragraph_end))
+            candidate = f"{previous} {pending}".strip()
+            if len(candidate) <= maximum_chars:
+                merged.append((candidate, paragraph_end or pending_end))
+            else:
+                merged.append((previous, paragraph_end))
+                merged.append((pending, pending_end))
         else:
-            merged.append((pending, True))
+            merged.append((pending, pending_end))
 
     return merged
 
@@ -1588,11 +1868,12 @@ def generate_chunk_with_retry(
     fidelity = float(settings.get("voice_fidelity", 0.93))
 
     if fidelity_mode:
-        # Clonagem fiel: reduz variação e exagero para a referência acústica
-        # exercer mais influência sobre o resultado.
-        effective_temperature = min(float(settings["temperature"]), 0.46)
-        effective_exaggeration = min(float(settings["exaggeration"]), 0.30)
-        effective_cfg = max(float(settings["cfg_weight"]), 0.70)
+        # Mantém o timbre da referência sem sufocar a variação natural. Os
+        # limites anteriores (0.46/0.30/0.70) deixavam a fala excessivamente
+        # rígida e contribuíam para o efeito robótico.
+        effective_temperature = min(float(settings["temperature"]), 0.56)
+        effective_exaggeration = min(float(settings["exaggeration"]), 0.40)
+        effective_cfg = max(float(settings["cfg_weight"]), 0.62)
     elif consistency_mode:
         # Mesmos parâmetros em todas as tentativas/chunks.
         effective_temperature = min(float(settings["temperature"]), 0.58)
@@ -1803,17 +2084,22 @@ def generate_long_project(
         preserve_complete_sentences=settings["preserve_complete_sentences"],
         split_by_legal_structure=settings["split_by_legal_structure"],
         context_margin_words=settings["chunk_overlap_words"],
+        target=int(settings["chunk_target"]),
     )
     chunks_before_merge = len(raw_chunks)
-    chunks = merge_tiny_chunks(raw_chunks)
+    chunks = merge_tiny_chunks(
+        raw_chunks,
+        maximum_chars=int(settings["chunk_limit"]),
+    )
     if not chunks:
         raise ValueError("Nenhum trecho válido foi produzido.")
     integrity = validate_chunk_integrity(prepared, chunks)
     integrity["chunks_before_merge"] = chunks_before_merge
     integrity["chunks_after_merge"] = len(chunks)
 
-    output_format = "mp3"
-    mp3_bitrate = str(data.get("mp3_bitrate") or "160k")
+    mp3_bitrate = str(data.get("mp3_bitrate") or "160k").strip().lower()
+    if mp3_bitrate not in {"96k", "128k", "160k", "192k", "256k", "320k"}:
+        mp3_bitrate = "160k"
     model = get_model()
     started = time.time()
 
@@ -1833,115 +2119,64 @@ def generate_long_project(
             f"voice_consistency_mode={str(settings['voice_consistency_mode']).lower()}",
             flush=True,
         )
-        chunks_dir = root / "chunks"
-        chunks_dir.mkdir(parents=True, exist_ok=True)
-        concat_file = root / "concat.txt"
+        raw_wav = root / "ctec-audio-continuo.wav"
         final_path = root / "ctec-audio-longo.mp3"
 
-        marker_list = []
-        concat_lines = []
-        cumulative_seconds = 0.0
+        marker_list: list[dict[str, Any]] = []
         total = len(chunks)
+        speed = float(settings["speed"])
 
-        for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
-            percent = 8 + int((index - 1) / max(1, total) * 82)
-            runpod.serverless.progress_update(
-                job,
-                json.dumps({
-                    "stage": "generating",
-                    "stageLabel": f"Gerando trecho {index} de {total}",
-                    "progress": percent / 100,
-                    "currentChunk": index,
-                    "totalChunks": total,
-                    "elapsedSeconds": int(time.time() - started),
-                }),
-            )
-
-            units = prosody_units_for_chunk(chunk, paragraph_end, settings)
-            if not units:
-                raise RuntimeError(
-                    f"O trecho {index}/{total} não gerou nenhuma unidade de prosódia."
+        # Uma chamada ao modelo por bloco semântico. Não divide mais cada frase,
+        # vírgula ou inciso em nova interpretação.
+        with ContinuousWaveAssembler(raw_wav, model.sr, settings) as assembler:
+            for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
+                percent = 8 + int((index - 1) / max(1, total) * 82)
+                runpod.serverless.progress_update(
+                    job,
+                    json.dumps({
+                        "stage": "generating",
+                        "stageLabel": f"Gerando bloco fluido {index} de {total}",
+                        "progress": percent / 100,
+                        "currentChunk": index,
+                        "totalChunks": total,
+                        "elapsedSeconds": int(time.time() - started),
+                    }),
                 )
 
-            chunk_segments: list[torch.Tensor] = []
-            for unit_number, (unit_text, internal_pause_ms) in enumerate(units, start=1):
-                audio_unit = generate_chunk_with_retry(
+                audio = generate_chunk_with_retry(
                     model,
-                    unit_text,
+                    chunk,
                     language_id=language_id,
                     reference_path=reference_path,
                     settings=settings,
-                    chunk_index=((index - 1) * 1000) + unit_number,
-                    total_chunks=max(total * 1000, ((index - 1) * 1000) + len(units)),
+                    chunk_index=index,
+                    total_chunks=total,
                     verification_dir=root / "verification",
                 )
-                if audio_unit.ndim == 1:
-                    audio_unit = audio_unit.unsqueeze(0)
-                chunk_segments.append(audio_unit)
-
-                # Dentro do chunk, aplica vírgula/ponto/dois-pontos/parágrafo.
-                # A pausa da última unidade é tratada abaixo para evitar duplicação.
-                if unit_number < len(units) and internal_pause_ms > 0:
-                    chunk_segments.append(torch.zeros(
-                        1,
-                        int(model.sr * internal_pause_ms / 1000.0),
-                        dtype=torch.float32,
-                    ))
-
-            audio = torch.cat(chunk_segments, dim=1)
-
-            wav_path = chunks_dir / f"{index:05d}.wav"
-            mp3_path = chunks_dir / f"{index:05d}.mp3"
-            torchaudio.save(str(wav_path), audio, model.sr)
-
-            # Última pausa do chunk vem da pontuação final / parágrafo.
-            final_unit_pause_ms = units[-1][1]
-            pause_ms = (
-                int(settings["final_silence_ms"])
-                if index == total
-                else final_unit_pause_ms
-            )
-            filters = []
-            standard_filter = build_ffmpeg_filter(
-                settings,
-                include_edge_silence=False,
-            )
-            if standard_filter:
-                filters.append(standard_filter)
-            if index == 1 and int(settings["initial_silence_ms"]) > 0:
-                filters.append(
-                    f"adelay={int(settings['initial_silence_ms'])}:all=1"
-                )
-            if pause_ms > 0:
-                filters.append(f"apad=pad_dur={pause_ms / 1000.0:.3f}")
-            command = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", str(wav_path),
-            ]
-            if filters:
-                command += ["-af", ",".join(filters)]
-            command += [
-                "-codec:a", "libmp3lame", "-b:a", mp3_bitrate, str(mp3_path)
-            ]
-            subprocess.run(command, check=True)
-            concat_lines.append(f"file '{mp3_path.as_posix()}'")
-
-            duration = float(audio.shape[1] / model.sr) / float(settings["speed"])
-            marker_list.append({
-                "index": index,
-                "startSeconds": round(cumulative_seconds, 2),
-                "durationSeconds": round(duration, 2),
-                "text": chunk[:500],
-            })
-            if index == 1:
-                cumulative_seconds += int(settings["initial_silence_ms"]) / 1000.0
-            cumulative_seconds += duration + pause_ms / 1000.0
+                seam = assembler.add(audio, chunk, paragraph_end)
+                marker_list.append({
+                    "index": index,
+                    "startSeconds": round(
+                        seam["startSample"] / model.sr / speed,
+                        2,
+                    ),
+                    "durationSeconds": round(
+                        seam["audioSamples"] / model.sr / speed,
+                        2,
+                    ),
+                    "text": chunk[:500],
+                    "join": {
+                        "insertedPauseMs": round(seam["insertedPauseMs"], 1),
+                        "leadingSilenceMs": round(seam["leadingSilenceMs"], 1),
+                        "trailingSilenceMs": round(seam["trailingSilenceMs"], 1),
+                    },
+                })
 
         runpod.serverless.progress_update(
             job,
             json.dumps({
                 "stage": "joining",
-                "stageLabel": "Unindo todos os trechos",
+                "stageLabel": "Finalizando áudio contínuo",
                 "progress": 0.93,
                 "currentChunk": total,
                 "totalChunks": total,
@@ -1949,17 +2184,23 @@ def generate_long_project(
             }),
         )
 
-        concat_file.write_text("\n".join(concat_lines), encoding="utf-8")
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "concat", "-safe", "0",
-                "-i", str(concat_file),
-                "-codec:a", "copy",
-                str(final_path),
-            ],
-            check=True,
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(raw_wav),
+        ]
+        final_filter = build_ffmpeg_filter(
+            settings,
+            include_edge_silence=False,
         )
+        if final_filter:
+            command += ["-filter:a", final_filter]
+        command += [
+            "-ac", "1", "-ar", str(model.sr),
+            "-codec:a", "libmp3lame", "-b:a", mp3_bitrate,
+            str(final_path),
+        ]
+        subprocess.run(command, check=True)
+        final_duration = probe_audio_duration(final_path)
 
         runpod.serverless.progress_update(
             job,
@@ -1984,9 +2225,10 @@ def generate_long_project(
             "file_name": final_path.name,
             "mime_type": "audio/mpeg",
             "size_bytes": final_path.stat().st_size,
-            "duration_seconds": round(cumulative_seconds, 2),
+            "duration_seconds": round(final_duration, 2),
             "chunks": total,
             "markers": marker_list,
+            "assembly": "single_pcm_then_single_mp3",
             "settings": public_settings(settings),
             "integrity": integrity,
             "reference_metrics": reference_metrics,
@@ -1998,6 +2240,7 @@ def generate_long_project(
                 "sentence_ms": settings["pause_sentence_ms"],
                 "colon_ms": settings["pause_colon_ms"],
                 "paragraph_ms": settings["pause_paragraph_ms"],
+                "internal_punctuation": "model_managed",
             },
             "elapsed_seconds": int(time.time() - started),
         }
@@ -2059,9 +2302,13 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         preserve_complete_sentences=settings["preserve_complete_sentences"],
         split_by_legal_structure=settings["split_by_legal_structure"],
         context_margin_words=settings["chunk_overlap_words"],
+        target=int(settings["chunk_target"]),
     )
     chunks_before_merge = len(raw_chunks)
-    chunks = merge_tiny_chunks(raw_chunks)
+    chunks = merge_tiny_chunks(
+        raw_chunks,
+        maximum_chars=int(settings["chunk_limit"]),
+    )
     if not chunks:
         raise ValueError(
             "O texto não gerou nenhum trecho válido depois da preparação jurídica."
@@ -2096,58 +2343,33 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         raw_wav = root / "raw.wav"
         final_path = root / f"ctec-voz-neural.{output_format}"
 
-        segments: list[torch.Tensor] = []
         total = len(chunks)
 
-        # As pausas da interface agora são aplicadas dentro dos chunks,
-        # exatamente nos sinais de pontuação correspondentes.
-        prosody_total = sum(
-            len(prosody_units_for_chunk(chunk, paragraph_end, settings))
-            for chunk, paragraph_end in chunks
-        )
-        prosody_index = 0
-
-        for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
-            runpod.serverless.progress_update(job, f"Gerando trecho {index} de {total}")
-            print(f"[CTEC] Gerando trecho {index}/{total}", flush=True)
-
-            units = prosody_units_for_chunk(chunk, paragraph_end, settings)
-            if not units:
-                raise RuntimeError(
-                    f"O trecho {index}/{total} não gerou nenhuma unidade de prosódia."
+        with ContinuousWaveAssembler(raw_wav, model.sr, settings) as assembler:
+            for index, (chunk, paragraph_end) in enumerate(chunks, start=1):
+                runpod.serverless.progress_update(
+                    job,
+                    f"Gerando bloco fluido {index} de {total}",
                 )
+                print(f"[CTEC] Gerando bloco fluido {index}/{total}", flush=True)
 
-            for unit_text, pause_ms in units:
-                prosody_index += 1
                 audio = generate_chunk_with_retry(
                     model,
-                    unit_text,
+                    chunk,
                     language_id=language_id,
                     reference_path=reference_path,
                     settings=settings,
-                    chunk_index=prosody_index,
-                    total_chunks=prosody_total,
+                    chunk_index=index,
+                    total_chunks=total,
                     verification_dir=root / "verification",
                 )
-
-                if audio.ndim == 1:
-                    audio = audio.unsqueeze(0)
-                segments.append(audio)
-
-                # A pausa final global é adicionada pelo filtro de saída.
-                is_final_unit = prosody_index == prosody_total
-                if pause_ms > 0 and not is_final_unit:
-                    segments.append(torch.zeros(
-                        1,
-                        int(model.sr * pause_ms / 1000.0),
-                        dtype=torch.float32,
-                    ))
-
-        combined = torch.cat(segments, dim=1)
-        torchaudio.save(str(raw_wav), combined, model.sr)
+                assembler.add(audio, chunk, paragraph_end)
 
         command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw_wav)]
-        audio_filter = build_ffmpeg_filter(settings)
+        audio_filter = build_ffmpeg_filter(
+            settings,
+            include_edge_silence=False,
+        )
         if audio_filter:
             command += ["-filter:a", audio_filter]
 
@@ -2159,17 +2381,11 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
             mime_type = "audio/wav"
 
         subprocess.run(command, check=True)
+        duration_seconds = round(probe_audio_duration(final_path), 2)
         encoded = encode_output(final_path)
         recognized_text = ""
         if to_bool(data.get("verify_transcript"), True):
             recognized_text = transcribe_audio(final_path)
-
-        duration_seconds = round(
-            combined.shape[1] / model.sr / float(settings["speed"])
-            + int(settings["initial_silence_ms"]) / 1000.0
-            + int(settings["final_silence_ms"]) / 1000.0,
-            2,
-        )
 
         return {
             "status": "ok",
@@ -2181,8 +2397,9 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
             "sample_rate": model.sr,
             "duration_seconds_estimate": duration_seconds,
             "device": DEVICE,
-            "model": MODEL_VERSION,
+            "model": _LOADED_MODEL_VERSION or MODEL_VERSION,
             "chunks": total,
+            "assembly": "single_pcm_then_single_encoding",
             "voice_id": str(data.get("voice_id") or "") or None,
             "settings": public_settings(settings),
             "prepared_text": text,
@@ -2196,6 +2413,7 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 "sentence_ms": settings["pause_sentence_ms"],
                 "colon_ms": settings["pause_colon_ms"],
                 "paragraph_ms": settings["pause_paragraph_ms"],
+                "internal_punctuation": "model_managed",
             },
             "recognized_text": recognized_text,
             "transcription_similarity": round(
@@ -2206,6 +2424,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.3.1...", flush=True)
-    print(f"[CTEC] Device: {DEVICE} | Modelo: {MODEL_VERSION}", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.0...", flush=True)
+    print(f"[CTEC] Device: {DEVICE} | Modelo solicitado: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
