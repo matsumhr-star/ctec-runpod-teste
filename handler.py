@@ -13,7 +13,9 @@ import urllib.parse
 import difflib
 import statistics
 import hashlib
+import unicodedata
 import wave
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -1071,40 +1073,313 @@ def transcription_similarity(expected: str, actual: str) -> float:
 
 def _roman_token_to_number(token: str) -> str:
     raw = str(token or "").strip().upper()
-    if not raw or not re.fullmatch(r"[IVXLCDM]+", raw):
+    if not raw or not re.fullmatch(
+        r"M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})",
+        raw,
+    ):
         return str(token or "")
     value = roman_to_int(raw)
     return str(value) if value > 0 else str(token or "")
 
 
-def normalize_legal_verification_text(value: str) -> str:
-    """
-    Normalização apenas para conferência do Whisper.
-    Considera equivalentes:
-      Título I == Título 1
-      Capítulo IV == Capítulo 4
-      Seção II == Seção 2
-      Inciso I == Inciso 1
-    sem alterar o texto narrado.
-    """
-    normalized = normalize_compare_text(value)
-    tokens = normalized.split()
-    legal_heads = {
-        "título", "titulo", "capítulo", "capitulo", "seção", "secao",
-        "subseção", "subsecao", "livro", "parte",
-        "artigo", "inciso", "parágrafo", "paragrafo", "alínea", "alinea", "item"
+_LEGAL_HEAD_CANONICAL = {
+    "art": "artigo",
+    "artigo": "artigo",
+    "paragrafo": "paragrafo",
+    "inciso": "inciso",
+    "alinea": "alinea",
+    "item": "item",
+    "titulo": "titulo",
+    "capitulo": "capitulo",
+    "secao": "secao",
+    "subsecao": "subsecao",
+    "livro": "livro",
+    "parte": "parte",
+}
+
+_LEGAL_NUMBER_COMPONENTS = {
+    "zero": 0,
+    "um": 1, "uma": 1, "primeiro": 1, "primeira": 1,
+    "dois": 2, "duas": 2, "segundo": 2, "segunda": 2,
+    "tres": 3, "terceiro": 3, "terceira": 3,
+    "quatro": 4, "quarto": 4, "quarta": 4,
+    "cinco": 5, "quinto": 5, "quinta": 5,
+    "seis": 6, "sexto": 6, "sexta": 6,
+    "sete": 7, "setimo": 7, "setima": 7,
+    "oito": 8, "oitavo": 8, "oitava": 8,
+    "nove": 9, "nono": 9, "nona": 9,
+    "dez": 10, "decimo": 10, "decima": 10,
+    "onze": 11, "decimo-primeiro": 11, "decima-primeira": 11,
+    "doze": 12, "decimo-segundo": 12, "decima-segunda": 12,
+    "treze": 13, "decimo-terceiro": 13, "decima-terceira": 13,
+    "quatorze": 14, "catorze": 14,
+    "quinze": 15,
+    "dezesseis": 16, "dezasseis": 16,
+    "dezessete": 17, "dezassete": 17,
+    "dezoito": 18,
+    "dezenove": 19,
+    "vinte": 20, "vigesimo": 20, "vigesima": 20,
+    "trinta": 30, "trigesimo": 30, "trigesima": 30,
+    "quarenta": 40, "quadragesimo": 40, "quadragesima": 40,
+    "cinquenta": 50, "quinquagesimo": 50, "quinquagesima": 50,
+    "sessenta": 60, "sexagesimo": 60, "sexagesima": 60,
+    "setenta": 70, "septuagesimo": 70, "septuagesima": 70,
+    "oitenta": 80, "octogesimo": 80, "octogesima": 80,
+    "noventa": 90, "nonagesimo": 90, "nonagesima": 90,
+    "cem": 100, "cento": 100, "centesimo": 100, "centesima": 100,
+    "duzentos": 200, "duzentas": 200, "ducentesimo": 200, "ducentesima": 200,
+    "trezentos": 300, "trezentas": 300, "trecentesimo": 300, "trecentesima": 300,
+    "quatrocentos": 400, "quatrocentas": 400, "quadringentesimo": 400,
+    "quadringentesima": 400,
+    "quinhentos": 500, "quinhentas": 500, "quingentesimo": 500,
+    "quingentesima": 500,
+    "seiscentos": 600, "seiscentas": 600, "sexcentesimo": 600,
+    "sexcentesima": 600,
+    "setecentos": 700, "setecentas": 700, "septingentesimo": 700,
+    "septingentesima": 700,
+    "oitocentos": 800, "oitocentas": 800, "octingentesimo": 800,
+    "octingentesima": 800,
+    "novecentos": 900, "novecentas": 900, "nongentesimo": 900,
+    "nongentesima": 900,
+}
+
+
+def _verification_plain_token(value: str) -> str:
+    raw = re.sub(
+        r"(\d+)[º°ª]",
+        r"\1",
+        str(value or "").lower(),
+    )
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(
+        char for char in normalized
+        if not unicodedata.combining(char)
+    )
+    return normalized.strip()
+
+
+def _verification_display_tokens(value: str) -> list[tuple[str, str]]:
+    # NFC preserva º/ª como símbolos. NFKC os transformaria em letras soltas
+    # ("1º" -> "1o"), criando um token extra artificial.
+    source = unicodedata.normalize("NFC", str(value or "")).lower()
+    raw_tokens = re.findall(
+        r"§|\d+[º°ª]?|[a-zA-ZÀ-ÖØ-öø-ÿ]+",
+        source,
+        flags=re.UNICODE,
+    )
+    output: list[tuple[str, str]] = []
+    for raw in raw_tokens:
+        plain = "paragrafo" if raw == "§" else _verification_plain_token(raw)
+        if plain:
+            output.append((raw, plain))
+    return output
+
+
+def _consume_legal_number(
+    tokens: list[tuple[str, str]],
+    start: int,
+) -> tuple[str | None, int]:
+    if start >= len(tokens):
+        return None, start
+
+    token = tokens[start][1]
+    if token.isdigit():
+        return str(int(token)), start + 1
+
+    roman = _roman_token_to_number(token)
+    if roman != token and roman.isdigit():
+        return roman, start + 1
+
+    total = 0
+    consumed = 0
+    index = start
+    while index < len(tokens):
+        current = tokens[index][1]
+        if current == "e" and consumed:
+            if (
+                index + 1 < len(tokens)
+                and tokens[index + 1][1] in (
+                    set(_LEGAL_NUMBER_COMPONENTS) | {"mil"}
+                )
+            ):
+                index += 1
+                continue
+            break
+        if current == "mil":
+            total = max(1, total) * 1000
+            consumed += 1
+            index += 1
+            continue
+        component = _LEGAL_NUMBER_COMPONENTS.get(current)
+        if component is None:
+            break
+        total += component
+        consumed += 1
+        index += 1
+
+    if not consumed:
+        return None, start
+    return str(total), index
+
+
+def _normalize_legal_validation(value: str) -> dict[str, Any]:
+    """Normaliza somente a cópia usada para validar a transcrição."""
+    tokens = _verification_display_tokens(value)
+    normalized: list[str] = []
+    references: list[dict[str, str]] = []
+    index = 0
+
+    while index < len(tokens):
+        raw, plain = tokens[index]
+        head = _LEGAL_HEAD_CANONICAL.get(plain)
+        if head is None:
+            normalized.append(plain)
+            index += 1
+            continue
+
+        start = index
+        index += 1
+        canonical_value: str | None = None
+
+        if index < len(tokens) and tokens[index][1] in {"unico", "unica"}:
+            canonical_value = "unico"
+            index += 1
+        elif head == "alinea" and index < len(tokens):
+            possible_letter = tokens[index][1]
+            if re.fullmatch(r"[a-z]", possible_letter):
+                canonical_value = possible_letter
+                index += 1
+        else:
+            canonical_value, consumed_until = _consume_legal_number(tokens, index)
+            if canonical_value is not None:
+                index = consumed_until
+
+        normalized.append(head)
+        if canonical_value is not None:
+            normalized.append(canonical_value)
+            original = " ".join(item[0] for item in tokens[start:index])
+            references.append({
+                "original": original,
+                "canonical": f"{head} {canonical_value}",
+            })
+        elif plain != head:
+            references.append({
+                "original": raw,
+                "canonical": head,
+            })
+
+    return {
+        "normalized_text": " ".join(normalized),
+        "tokens": normalized,
+        "references": references,
     }
 
-    output = []
-    previous = ""
-    for token in tokens:
-        current = token
-        if previous in legal_heads and re.fullmatch(r"[ivxlcdm]+", token, flags=re.IGNORECASE):
-            current = _roman_token_to_number(token)
-        output.append(current)
-        previous = current.lower()
 
-    return " ".join(output)
+def normalize_legal_verification_text(value: str) -> str:
+    """
+    Normalização contextual usada apenas para comparar TTS com Whisper.
+    O texto narrado, salvo e exibido nunca passa por esta função.
+    """
+    return str(_normalize_legal_validation(value)["normalized_text"])
+
+
+def _tokens_not_found(
+    source: list[str],
+    other: list[str],
+) -> list[str]:
+    remaining = Counter(other)
+    missing: list[str] = []
+    for token in source:
+        if remaining[token] > 0:
+            remaining[token] -= 1
+        else:
+            missing.append(token)
+    return missing
+
+
+def _normalized_legal_divergences(
+    expected_references: list[dict[str, str]],
+    actual_references: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    divergences: list[dict[str, str]] = []
+    used_actual: set[int] = set()
+    for expected in expected_references:
+        for actual_index, actual in enumerate(actual_references):
+            if actual_index in used_actual:
+                continue
+            if expected["canonical"] != actual["canonical"]:
+                continue
+            used_actual.add(actual_index)
+            expected_form = _verification_plain_token(expected["original"])
+            actual_form = _verification_plain_token(actual["original"])
+            if expected_form != actual_form:
+                divergences.append({
+                    "esperado": expected["original"],
+                    "reconhecido": actual["original"],
+                    "normalizado": expected["canonical"],
+                    "resultado": "EQUIVALENTE",
+                })
+            break
+    return divergences
+
+
+def validate_legal_transcription(
+    expected: str,
+    actual: str,
+    threshold: float,
+) -> dict[str, Any]:
+    expected_result = _normalize_legal_validation(expected)
+    actual_result = _normalize_legal_validation(actual)
+    expected_text = str(expected_result["normalized_text"])
+    actual_text = str(actual_result["normalized_text"])
+    expected_tokens = list(expected_result["tokens"])
+    actual_tokens = list(actual_result["tokens"])
+
+    if expected_text and actual_text:
+        similarity = difflib.SequenceMatcher(
+            None,
+            expected_text,
+            actual_text,
+            autojunk=False,
+        ).ratio()
+        matcher = difflib.SequenceMatcher(
+            None,
+            expected_tokens,
+            actual_tokens,
+            autojunk=False,
+        )
+        matched = sum(block.size for block in matcher.get_matching_blocks())
+        recall = matched / max(1, len(expected_tokens))
+    else:
+        similarity = 0.0
+        recall = 0.0
+
+    missing_tokens = _tokens_not_found(expected_tokens, actual_tokens)
+    extra_tokens = _tokens_not_found(actual_tokens, expected_tokens)
+    normalized_divergences = _normalized_legal_divergences(
+        list(expected_result["references"]),
+        list(actual_result["references"]),
+    )
+    similarity_threshold = max(0.78, float(threshold) - 0.08)
+    approved = (
+        recall >= float(threshold)
+        and similarity >= similarity_threshold
+    )
+
+    return {
+        "approved": approved,
+        "similarity": similarity,
+        "recall": recall,
+        "similarity_threshold": similarity_threshold,
+        "recall_threshold": float(threshold),
+        "expected_normalized": expected_text,
+        "recognized_normalized": actual_text,
+        "missing_expected_tokens": missing_tokens,
+        "extra_recognized_tokens": extra_tokens,
+        "normalized_divergences": normalized_divergences,
+        "equivalent_representation": bool(normalized_divergences),
+        "material_omission": bool(missing_tokens) and recall < float(threshold),
+    }
 
 
 def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
@@ -1123,25 +1398,7 @@ def legal_short_chunk_equivalent(expected: str, actual: str) -> bool:
     if a == b:
         return True
 
-    expected_tokens = a.split()
-    actual_tokens = b.split()
-
-    if len(expected_tokens) > 6 or len(actual_tokens) > 6:
-        return False
-
-    legal_heads = {
-        "artigo", "inciso", "parágrafo", "paragrafo",
-        "alínea", "alinea", "item",
-        "título", "titulo", "capítulo", "capitulo",
-        "seção", "secao", "subseção", "subsecao",
-        "livro", "parte"
-    }
-    if not expected_tokens or expected_tokens[0] not in legal_heads:
-        return False
-    if not actual_tokens or actual_tokens[0] not in legal_heads:
-        return False
-
-    return expected_tokens == actual_tokens
+    return a == b
 
 
 def transcribe_audio(path: Path) -> str:
@@ -1362,7 +1619,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.4.0",
+        "version": "5.4.2",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {effective_model}",
@@ -1394,6 +1651,8 @@ def capabilities() -> dict[str, Any]:
         "ui_pause_controls_applied_inside_chunks": True,
         "calibration_uses_own_scoring": True,
         "whisper_numeric_equivalence": True,
+        "contextual_legal_validation": True,
+        "validation_token_diagnostics": True,
     }
 
 
@@ -1900,6 +2159,7 @@ def generate_chunk_with_retry(
     last_transcript = ""
     last_similarity = 0.0
     last_recall = 0.0
+    last_validation: dict[str, Any] | None = None
 
     for attempt_index in range(1, max_attempts + 1):
         try:
@@ -1950,33 +2210,26 @@ def generate_chunk_with_retry(
 
                 transcript = transcribe_audio(verify_path)
 
-                verify_expected = normalize_legal_verification_text(candidate)
-                verify_actual = normalize_legal_verification_text(transcript)
-
-                similarity = transcription_similarity(
-                    verify_expected,
-                    verify_actual,
+                validation = validate_legal_transcription(
+                    candidate,
+                    transcript,
+                    verify_threshold,
                 )
-                recall = transcription_word_recall(
-                    verify_expected,
-                    verify_actual,
-                )
+                similarity = float(validation["similarity"])
+                recall = float(validation["recall"])
 
                 last_transcript = transcript
                 last_similarity = similarity
                 last_recall = recall
+                last_validation = validation
 
                 # Para evitar informação pulada, recall pesa mais que similaridade geral.
-                # Estruturas jurídicas curtas podem ser transcritas pelo Whisper com
-                # algarismo em vez de palavra ("Inciso 1" x "Inciso um").
-                semantic_equivalent = legal_short_chunk_equivalent(
-                    candidate,
-                    transcript,
+                # Equivalências jurídicas são resolvidas na cópia normalizada antes
+                # do cálculo; elas nunca ignoram os thresholds nem mascaram omissões.
+                semantic_equivalent = bool(
+                    validation["equivalent_representation"]
                 )
-                approved = semantic_equivalent or (
-                    recall >= verify_threshold
-                    and similarity >= max(0.78, verify_threshold - 0.08)
-                )
+                approved = bool(validation["approved"])
 
                 print(
                     "[CTEC] Verificação Whisper: "
@@ -1987,6 +2240,26 @@ def generate_chunk_with_retry(
                     f"semantic_equivalent={str(semantic_equivalent).lower()} | "
                     f"approved={str(approved).lower()} | "
                     f"recognized={transcript[:180]!r}",
+                    flush=True,
+                )
+                print(
+                    "[CTEC] Diagnóstico da validação: "
+                    + json.dumps({
+                        "chunk": f"{chunk_index}/{total_chunks}",
+                        "attempt": attempt_index,
+                        "expectedNormalized": validation["expected_normalized"],
+                        "recognizedNormalized": validation["recognized_normalized"],
+                        "missingExpectedTokens": validation[
+                            "missing_expected_tokens"
+                        ],
+                        "extraRecognizedTokens": validation[
+                            "extra_recognized_tokens"
+                        ],
+                        "normalizedDivergences": validation[
+                            "normalized_divergences"
+                        ],
+                        "materialOmission": validation["material_omission"],
+                    }, ensure_ascii=False),
                     flush=True,
                 )
 
@@ -2013,10 +2286,27 @@ def generate_chunk_with_retry(
 
     details = ""
     if last_transcript:
+        validation_details = {}
+        if last_validation is not None:
+            validation_details = {
+                "tokens_esperados_nao_encontrados": last_validation[
+                    "missing_expected_tokens"
+                ],
+                "tokens_extras_reconhecidos": last_validation[
+                    "extra_recognized_tokens"
+                ],
+                "divergencias_normalizadas": last_validation[
+                    "normalized_divergences"
+                ],
+                "omissao_material": last_validation["material_omission"],
+            }
         details = (
             f" Similaridade final: {last_similarity:.3f}; "
             f"recall final: {last_recall:.3f}; "
-            f"reconhecido: {last_transcript[:220]!r}."
+            f"reconhecido: {last_transcript[:600]!r}; "
+            "diagnóstico: "
+            + json.dumps(validation_details, ensure_ascii=False)
+            + "."
         )
 
     raise RuntimeError(
@@ -2424,6 +2714,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.0...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.2...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo solicitado: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
