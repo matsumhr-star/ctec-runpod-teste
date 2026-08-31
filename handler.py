@@ -1,6 +1,7 @@
 import base64
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -15,7 +16,7 @@ import statistics
 import hashlib
 import unicodedata
 import wave
-from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,34 @@ MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
 MAX_REFERENCE_BYTES = int(os.getenv("CTEC_MAX_REFERENCE_BYTES", str(30 * 1024 * 1024)))
 MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 * 1024 * 1024)))
 SAFE_TTS_FALLBACK_CHARS = int(os.getenv("CTEC_SAFE_TTS_FALLBACK_CHARS", "140"))
+MIN_TTS_SUBCHUNK_CHARS = int(os.getenv("CTEC_MIN_TTS_SUBCHUNK_CHARS", "72"))
+MAX_ADAPTIVE_FALLBACK_DEPTH = int(os.getenv("CTEC_MAX_FALLBACK_DEPTH", "3"))
+EARLY_EOS_MIN_WORDS = int(os.getenv("CTEC_EARLY_EOS_MIN_WORDS", "10"))
+EARLY_EOS_NARRATION_WPM = float(os.getenv("CTEC_EARLY_EOS_WPM", "155"))
+EARLY_EOS_MIN_DURATION_RATIO = float(
+    os.getenv("CTEC_EARLY_EOS_MIN_DURATION_RATIO", "0.45")
+)
 WORKER_CONTRACT_VERSION = 2
+
+_LEGAL_NUMBER_WORDS = (
+    "zero|um|uma|dois|duas|três|tres|quatro|cinco|seis|sete|oito|nove|dez|"
+    "onze|doze|treze|catorze|quatorze|quinze|dezesseis|dezessete|dezoito|"
+    "dezenove|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|"
+    "noventa|cem|cento|duzentos|duzentas|trezentos|trezentas|quatrocentos|"
+    "quatrocentas|quinhentos|quinhentas|seiscentos|seiscentas|setecentos|"
+    "setecentas|oitocentos|oitocentas|novecentos|novecentas|mil|milhão|"
+    "milhao|milhões|milhoes|primeiro|primeira|segundo|segunda|terceiro|"
+    "terceira|quarto|quarta|quinto|quinta|sexto|sexta|sétimo|setimo|sétima|"
+    "setima|oitavo|oitava|nono|nona|décimo|decimo|décima|decima"
+)
+_LEGAL_NUMBER_EXPRESSION = (
+    rf"(?:{_LEGAL_NUMBER_WORDS})"
+    rf"(?:\s+(?:e\s+)?(?:{_LEGAL_NUMBER_WORDS})){{0,12}}"
+)
+_LEGAL_MONTHS = (
+    "janeiro|fevereiro|março|marco|abril|maio|junho|julho|agosto|"
+    "setembro|outubro|novembro|dezembro"
+)
 
 _MODEL: ChatterboxMultilingualTTS | None = None
 _LOADED_MODEL_VERSION: str | None = None
@@ -45,6 +73,116 @@ _MODEL_LOCK = threading.Lock()
 _GENERATION_LOCK = threading.Lock()
 _WHISPER = None
 _WHISPER_LOCK = threading.Lock()
+
+
+class _ChatterboxGenerationLogCapture(logging.Handler):
+    """Observa os avisos do Chatterbox sem alterar a biblioteca instalada."""
+
+    _REPETITION_RE = re.compile(
+        r"Detected\s+(\d+)x\s+repetition\s+of\s+token\s+([^\s,;]+)",
+        re.IGNORECASE,
+    )
+    _EOS_STEP_RE = re.compile(
+        r"Stopping\s+generation\s+at\s+step\s+(\d+)",
+        re.IGNORECASE,
+    )
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.messages: list[str] = []
+        self.repetition_count: int | None = None
+        self.repeated_token: str | None = None
+        self.token_repetition = False
+        self.long_tail = False
+        self.alignment_repetition = False
+        self.eos_detected = False
+        self.eos_step: int | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.feed(record.getMessage())
+        except Exception:
+            return
+
+    def feed(self, message: str) -> None:
+        clean = str(message or "").strip()
+        if not clean:
+            return
+        relevant = (
+            "repetition of token" in clean
+            or "forcing EOS token" in clean
+            or "EOS token detected" in clean
+        )
+        if not relevant:
+            return
+        self.messages.append(clean[:600])
+        repetition = self._REPETITION_RE.search(clean)
+        if repetition:
+            self.repetition_count = int(repetition.group(1))
+            self.repeated_token = repetition.group(2)
+        if "forcing EOS token" in clean:
+            self.token_repetition = bool(re.search(
+                r"token_repetition\s*=\s*True", clean, re.IGNORECASE
+            ))
+            self.long_tail = bool(re.search(
+                r"long_tail\s*=\s*True", clean, re.IGNORECASE
+            ))
+            self.alignment_repetition = bool(re.search(
+                r"alignment_repetition\s*=\s*True", clean, re.IGNORECASE
+            ))
+        if "EOS token detected" in clean:
+            self.eos_detected = True
+            step = self._EOS_STEP_RE.search(clean)
+            if step:
+                self.eos_step = int(step.group(1))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "token_repetition": self.token_repetition,
+            "repetition_count": self.repetition_count,
+            "repeated_token": self.repeated_token,
+            "long_tail": self.long_tail,
+            "alignment_repetition": self.alignment_repetition,
+            "eos_detected": self.eos_detected,
+            "eos_step": self.eos_step,
+            "messages": self.messages,
+        }
+
+
+@contextmanager
+def _capture_chatterbox_generation_logs():
+    """Captura logging/loguru durante uma geração serializada pelo worker."""
+    capture = _ChatterboxGenerationLogCapture()
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    root_logger.addHandler(capture)
+    if previous_level > logging.INFO:
+        root_logger.setLevel(logging.INFO)
+
+    loguru_logger = None
+    loguru_sink_id = None
+    try:
+        try:
+            from loguru import logger as imported_loguru_logger
+
+            loguru_logger = imported_loguru_logger
+            loguru_sink_id = loguru_logger.add(
+                lambda message: capture.feed(str(message)),
+                level="INFO",
+                format="{message}",
+            )
+        except Exception:
+            loguru_logger = None
+            loguru_sink_id = None
+        yield capture
+    finally:
+        root_logger.removeHandler(capture)
+        root_logger.setLevel(previous_level)
+        if loguru_logger is not None and loguru_sink_id is not None:
+            try:
+                loguru_logger.remove(loguru_sink_id)
+            except Exception:
+                pass
 
 
 PROFILES: dict[str, dict[str, Any]] = {
@@ -281,6 +419,49 @@ def apply_pronunciation_dictionary(
     return text
 
 
+def punctuate_legal_speech_structure(text: str) -> str:
+    """Acrescenta somente pausas de fala; não muda nenhuma palavra da lei."""
+    # Cabeçalhos que vieram em uma linha própria do PDF.
+    text = re.sub(
+        r"(?m)^\s*([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{4,})\s*$",
+        lambda match: match.group(1).strip() + ".",
+        text,
+    )
+
+    # "Capítulo um DISPOSIÇÕES..." vira "Capítulo um. DISPOSIÇÕES...".
+    heading_pattern = rf"(?:Título|Capítulo|Seção|Subseção|Livro|Parte)\s+{_LEGAL_NUMBER_EXPRESSION}"
+    text = re.sub(
+        rf"\b({heading_pattern})"
+        rf"(?=\s+(?!(?:e\s+)?(?:{_LEGAL_NUMBER_WORDS})\b)"
+        rf"[A-Za-zÀ-ÖØ-öø-ÿ])",
+        r"\1. ",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Se o título em caixa alta estiver colado ao artigo, cria a fronteira de fala.
+    text = re.sub(
+        r"([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{4,})"
+        r"(?=\s+Artigo\b)",
+        lambda match: match.group(1).rstrip() + ".",
+        text,
+    )
+
+    # Só trata Artigo/Parágrafo/Inciso como cabeçalho quando aparecem no início
+    # ou depois de uma fronteira forte. Referências como "no Artigo 165" ficam intactas.
+    provision_pattern = rf"(?:Artigo|Parágrafo|Inciso)\s+{_LEGAL_NUMBER_EXPRESSION}"
+    text = re.sub(
+        rf"(^|[.!?:]\s+)({provision_pattern})"
+        rf"(?=\s+(?!(?:e\s+)?(?:{_LEGAL_NUMBER_WORDS})\b)"
+        rf"[A-Za-zÀ-ÖØ-öø-ÿ])",
+        lambda match: match.group(1) + match.group(2).rstrip() + ". ",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = re.sub(r"\.{2,}", ".", text)
+    return text
+
+
 def normalize_law_text(
     text: str,
     custom_dictionary: list[dict[str, Any]] | None = None,
@@ -294,12 +475,12 @@ def normalize_law_text(
 
     text = re.sub(r"§\s*único", "Parágrafo único", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"§\s*(\d+)\s*[º°]?",
+        r"§\s*(\d+)(?:\s*[º°])?",
         lambda match: f"Parágrafo {number_words(int(match.group(1)), True)}",
         text,
     )
     text = re.sub(
-        r"\bArts?\.\s*(\d+)\s*[º°]?",
+        r"\bArts?\.\s*(\d+)(?:\s*[º°])?",
         lambda match: (
             f"Artigo {number_words(int(match.group(1)), True)}"
             if int(match.group(1)) <= 9
@@ -309,11 +490,25 @@ def normalize_law_text(
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"\bArtigo\s+(\d+)\s*[º°]?",
+        r"\bArtigo\s+(\d+)(?:\s*[º°])?",
         lambda match: (
             f"Artigo {number_words(int(match.group(1)), True)}"
             if int(match.group(1)) <= 9
             else f"Artigo {number_words(int(match.group(1)))}"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Algarismos romanos de cabeçalhos precisam ser escritos por extenso na
+    # cópia narrada. Caso contrário, "CAPÍTULO I" tende a ser pronunciado como
+    # a letra "i" e o ASR pode registrar apenas a conjunção "e".
+    text = re.sub(
+        r"\b(Título|Capítulo|Seção|Subseção|Livro|Parte)\s+"
+        r"([IVXLCDM]{1,12})\b",
+        lambda match: (
+            f"{match.group(1)} "
+            f"{number_words(roman_to_int(match.group(2)))}"
         ),
         text,
         flags=re.IGNORECASE,
@@ -362,6 +557,28 @@ def normalize_law_text(
         text = re.sub(pattern, spoken, text, flags=re.IGNORECASE)
 
     text = re.sub(
+        r"\bLei\s+Complementar\s+número\s+(\d{1,6})\b",
+        lambda match: "Lei Complementar número " + number_words(int(match.group(1))),
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\b(\d{{1,2}})\s+de\s+({_LEGAL_MONTHS})\s+de\s+(\d{{4}})\b",
+        lambda match: (
+            f"{number_words(int(match.group(1)))} de {match.group(2)} de "
+            f"{number_words(int(match.group(3)))}"
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(para|exercício\s+de|ano\s+de)\s+((?:19|20)\d{2})\b",
+        lambda match: f"{match.group(1)} {number_words(int(match.group(2)))}",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
         r"\bLei\s+número\s+(\d{1,6})(?:\.(\d{3}))?/(\d{2,4})\b",
         lambda match: (
             "Lei número "
@@ -388,6 +605,7 @@ def normalize_law_text(
     text = re.sub(r"\s*:\s*", ": ", text)
     text = re.sub(r"\s*[—–]\s*", " — ", text)
     text = re.sub(r" +([,.;:])", r"\1", text)
+    text = punctuate_legal_speech_structure(text)
     return collapse_soft_line_breaks(text)
 
 
@@ -519,6 +737,268 @@ def split_text(
 
     flush()
     return chunks
+
+
+def legal_chunk_complexity(value: str) -> dict[str, Any]:
+    """Classifica dificuldade jurídica sem usar só a quantidade de caracteres."""
+    text = str(value or "")
+    plain = "".join(
+        char for char in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(char) != "Mn"
+    )
+    legal_references = len(re.findall(
+        r"\b(?:artigo|paragrafo|inciso|alinea|capitulo|titulo|secao|subsecao|"
+        r"lei complementar|constituicao|codigo)\b",
+        plain,
+    ))
+    numeric_references = len(re.findall(
+        r"\b(?:artigo|paragrafo|inciso|lei(?:\s+complementar)?(?:\s+numero)?)\s+"
+        r"(?:\d+|[ivxlcdm]+|zero|um|uma|dois|duas|tres|quatro|cinco|seis|sete|"
+        r"oito|nove|dez|primeiro|segundo|terceiro|cento|mil)\b",
+        plain,
+    ))
+    dates = len(re.findall(
+        r"\b(?:\d{1,2}|um|dois|tres|quatro|cinco|seis|sete|oito|nove|dez|"
+        r"onze|doze|treze|catorze|quinze|dezesseis|dezessete|dezoito|"
+        r"dezenove|vinte|trinta)\s+de\s+(?:" + _LEGAL_MONTHS.replace("ç", "c") + r")\b",
+        plain,
+    ))
+    uppercase_headings = len(re.findall(
+        r"(?:^|\s)(?:[A-ZÁÉÍÓÚÂÊÔÃÕÇ]{2,}(?:\s+|$)){2,}",
+        text,
+    ))
+    sentences = [item.strip() for item in re.split(r"[.!?]+", text) if item.strip()]
+    longest_sentence = max((len(item) for item in sentences), default=len(text))
+
+    score = min(8, legal_references)
+    score += min(6, numeric_references * 2)
+    score += min(4, dates * 2)
+    score += min(4, uppercase_headings * 2)
+    if longest_sentence > 180:
+        score += 2
+    if longest_sentence > 260:
+        score += 2
+    if legal_references >= 4:
+        score += 2
+
+    level = "alta" if score >= 10 else "média" if score >= 5 else "baixa"
+    return {
+        "level": level,
+        "score": score,
+        "characters": len(text),
+        "words": len(text.split()),
+        "legal_references": legal_references,
+        "numeric_references": numeric_references,
+        "dates": dates,
+        "uppercase_headings": uppercase_headings,
+        "longest_sentence": longest_sentence,
+    }
+
+
+def _protected_legal_reference_spans(value: str) -> list[tuple[int, int]]:
+    """Localiza referências que nunca podem ser cortadas no meio."""
+    number = rf"(?:\d+[º°]?|[IVXLCDM]+|{_LEGAL_NUMBER_EXPRESSION})"
+    patterns = [
+        rf"\bArtigo\s+{number}(?:\s*,?\s*Parágrafo\s+{number})?",
+        rf"\bParágrafo\s+{number}",
+        rf"\bInciso\s+{number}",
+        rf"\bLei\s+Complementar\s+(?:número\s+)?{number}"
+        rf"(?:\s*,?\s*de\s+{number}\s+de\s+(?:{_LEGAL_MONTHS})\s+de\s+{number})?",
+        rf"\b{number}\s+de\s+(?:{_LEGAL_MONTHS})\s+de\s+{number}\b",
+        r"\b(?:Art|Arts)\.\s*\d+[º°]?",
+        r"§\s*\d+[º°]?",
+    ]
+    spans: list[tuple[int, int]] = []
+    for pattern in patterns:
+        spans.extend(
+            (match.start(), match.end())
+            for match in re.finditer(pattern, value, flags=re.IGNORECASE)
+        )
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _boundary_cuts_protected_reference(
+    boundary: int,
+    spans: list[tuple[int, int]],
+) -> bool:
+    return any(start < boundary < end for start, end in spans)
+
+
+def _split_oversized_legal_unit(value: str, limit: int) -> list[str]:
+    """Usa ponto/semicolon/vírgula/palavra nessa ordem, protegendo referências."""
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(source) <= limit:
+        return [source] if source else []
+
+    spans = _protected_legal_reference_spans(source)
+    output: list[str] = []
+    start = 0
+    minimum = max(35, min(int(MIN_TTS_SUBCHUNK_CHARS), limit // 2))
+
+    while len(source) - start > limit:
+        upper = min(len(source), start + limit)
+        candidates: list[tuple[int, int]] = []
+        for match in re.finditer(r"[.!?;:,]\s+", source[start:upper + 1]):
+            boundary = start + match.end()
+            if boundary - start < minimum:
+                continue
+            if _boundary_cuts_protected_reference(boundary, spans):
+                continue
+            punctuation = source[boundary - 2:boundary].strip()[-1:]
+            priority = 0 if punctuation in ".!?" else 1 if punctuation in ";:" else 2
+            candidates.append((priority, boundary))
+
+        boundary = 0
+        if candidates:
+            # Mantém o ponto mais próximo do limite dentro da melhor prioridade.
+            best_priority = min(priority for priority, _ in candidates)
+            boundary = max(
+                point for priority, point in candidates
+                if priority == best_priority
+            )
+        else:
+            whitespace = [
+                start + match.start()
+                for match in re.finditer(r"\s+", source[start:upper + 1])
+                if start + match.start() - start >= minimum
+                and not _boundary_cuts_protected_reference(
+                    start + match.start(),
+                    spans,
+                )
+            ]
+            if whitespace:
+                boundary = max(whitespace)
+
+        if not boundary:
+            crossing = [
+                (span_start, span_end) for span_start, span_end in spans
+                if span_start < upper < span_end
+            ]
+            if crossing:
+                span_start, span_end = crossing[0]
+                if span_start - start >= minimum:
+                    boundary = span_start
+                else:
+                    boundary = span_end
+            else:
+                boundary = upper
+
+        piece = source[start:boundary].strip()
+        if not piece or boundary <= start:
+            break
+        output.append(piece)
+        start = boundary
+        while start < len(source) and source[start].isspace():
+            start += 1
+
+    tail = source[start:].strip()
+    if tail:
+        output.append(tail)
+    return output
+
+
+def _leading_legal_structure(value: str) -> str:
+    plain = "".join(
+        char for char in unicodedata.normalize("NFD", str(value or "").lower())
+        if unicodedata.category(char) != "Mn"
+    ).lstrip()
+    for name in ("titulo", "capitulo", "secao", "subsecao", "livro", "parte"):
+        if plain.startswith(name + " "):
+            return "heading"
+    if plain.startswith("artigo "):
+        return "article"
+    if plain.startswith("paragrafo "):
+        return "paragraph"
+    if plain.startswith("inciso "):
+        return "inciso"
+    if plain.startswith("alinea "):
+        return "alinea"
+    return "body"
+
+
+def split_legal_semantic_chunk(value: str, limit: int) -> list[str]:
+    """Divide em limites jurídicos e preserva a ordem/todos os tokens."""
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not source:
+        return []
+    limit = max(int(MIN_TTS_SUBCHUNK_CHARS), int(limit))
+
+    primary = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?;:])\s+", source)
+        if item.strip()
+    ]
+    units: list[str] = []
+    for item in primary:
+        units.extend(_split_oversized_legal_unit(item, limit))
+
+    chunks: list[str] = []
+    current = ""
+    current_kind = "body"
+    for unit in units:
+        unit_kind = _leading_legal_structure(unit)
+        force_boundary = bool(current) and unit_kind in {
+            "heading", "article", "paragraph", "inciso", "alinea",
+        }
+        candidate = f"{current} {unit}".strip()
+        if force_boundary or (current and len(candidate) > limit):
+            chunks.append(current)
+            current = unit
+            current_kind = unit_kind
+            continue
+        current = candidate
+        if current_kind == "body":
+            current_kind = unit_kind
+    if current:
+        chunks.append(current)
+
+    return [item for item in chunks if is_valid_generation_chunk(item)]
+
+
+def adapt_chunks_for_legal_complexity(
+    chunks: list[tuple[str, bool]],
+    maximum_chars: int,
+) -> list[tuple[str, bool]]:
+    """Reduz preventivamente somente blocos jurídicos médios/complexos."""
+    output: list[tuple[str, bool]] = []
+    for chunk, paragraph_end in chunks:
+        complexity = legal_chunk_complexity(chunk)
+        if complexity["level"] == "alta":
+            adaptive_limit = min(int(maximum_chars), 165)
+        elif complexity["level"] == "média":
+            adaptive_limit = min(int(maximum_chars), 205)
+        else:
+            adaptive_limit = int(maximum_chars)
+
+        if len(chunk) <= adaptive_limit:
+            output.append((chunk, paragraph_end))
+            continue
+
+        parts = split_legal_semantic_chunk(chunk, adaptive_limit)
+        if len(parts) <= 1:
+            output.append((chunk, paragraph_end))
+            continue
+        validate_chunk_integrity(chunk, [(part, False) for part in parts])
+        for index, part in enumerate(parts):
+            output.append((
+                part,
+                paragraph_end if index == len(parts) - 1 else False,
+            ))
+        print(
+            "[CTEC] Chunking jurídico adaptativo: "
+            f"complexidade={complexity['level']} | score={complexity['score']} | "
+            f"caracteres={len(chunk)} | limite={adaptive_limit} | "
+            f"subchunks={len(parts)}",
+            flush=True,
+        )
+    return output
 
 
 def download_url(url: str, destination: Path) -> None:
@@ -1284,18 +1764,97 @@ def normalize_legal_verification_text(value: str) -> str:
     return str(_normalize_legal_validation(value)["normalized_text"])
 
 
-def _tokens_not_found(
-    source: list[str],
-    other: list[str],
-) -> list[str]:
-    remaining = Counter(other)
-    missing: list[str] = []
-    for token in source:
-        if remaining[token] > 0:
-            remaining[token] -= 1
-        else:
-            missing.append(token)
-    return missing
+def _asr_phonetic_span_equivalence(
+    expected_tokens: list[str],
+    actual_tokens: list[str],
+    global_similarity: float,
+) -> dict[str, Any] | None:
+    """Reconcilia apenas segmentações fonéticas muito próximas feitas pelo ASR."""
+    if global_similarity < 0.94:
+        return None
+    if not expected_tokens or not actual_tokens:
+        return None
+    if len(expected_tokens) > 2 or len(actual_tokens) > 2:
+        return None
+    if len(expected_tokens) == len(actual_tokens) == 1:
+        return None
+    if any(
+        re.search(r"\d", token)
+        for token in expected_tokens + actual_tokens
+    ):
+        return None
+
+    expected_joined = "".join(expected_tokens)
+    actual_joined = "".join(actual_tokens)
+    if min(len(expected_joined), len(actual_joined)) < 8:
+        return None
+    if abs(len(expected_joined) - len(actual_joined)) > 3:
+        return None
+
+    phonetic_similarity = difflib.SequenceMatcher(
+        None,
+        expected_joined,
+        actual_joined,
+        autojunk=False,
+    ).ratio()
+    if phonetic_similarity < 0.92:
+        return None
+
+    return {
+        "esperado": " ".join(expected_tokens),
+        "reconhecido": " ".join(actual_tokens),
+        "similaridade_fonetica": round(phonetic_similarity, 3),
+        "resultado": "EQUIVALENTE_FONETICO_ASR",
+    }
+
+
+def _transcription_token_alignment(
+    expected_tokens: list[str],
+    actual_tokens: list[str],
+    global_similarity: float,
+) -> dict[str, Any]:
+    matcher = difflib.SequenceMatcher(
+        None,
+        expected_tokens,
+        actual_tokens,
+        autojunk=False,
+    )
+    exact_matches = 0
+    adjusted_matches = 0
+    missing_tokens: list[str] = []
+    extra_tokens: list[str] = []
+    phonetic_equivalences: list[dict[str, Any]] = []
+
+    for tag, expected_start, expected_end, actual_start, actual_end in (
+        matcher.get_opcodes()
+    ):
+        expected_span = expected_tokens[expected_start:expected_end]
+        actual_span = actual_tokens[actual_start:actual_end]
+        if tag == "equal":
+            exact_matches += len(expected_span)
+            adjusted_matches += len(expected_span)
+            continue
+        if tag == "replace":
+            equivalence = _asr_phonetic_span_equivalence(
+                expected_span,
+                actual_span,
+                global_similarity,
+            )
+            if equivalence is not None:
+                adjusted_matches += len(expected_span)
+                phonetic_equivalences.append(equivalence)
+                continue
+        missing_tokens.extend(expected_span)
+        extra_tokens.extend(actual_span)
+
+    denominator = max(1, len(expected_tokens))
+    return {
+        "raw_recall": exact_matches / denominator,
+        "recall": adjusted_matches / denominator,
+        "missing_tokens": missing_tokens,
+        "extra_tokens": extra_tokens,
+        "phonetic_equivalences": phonetic_equivalences,
+    }
 
 
 def _normalized_legal_divergences(
@@ -1343,43 +1902,50 @@ def validate_legal_transcription(
             actual_text,
             autojunk=False,
         ).ratio()
-        matcher = difflib.SequenceMatcher(
-            None,
-            expected_tokens,
-            actual_tokens,
-            autojunk=False,
-        )
-        matched = sum(block.size for block in matcher.get_matching_blocks())
-        recall = matched / max(1, len(expected_tokens))
     else:
         similarity = 0.0
-        recall = 0.0
-
-    missing_tokens = _tokens_not_found(expected_tokens, actual_tokens)
-    extra_tokens = _tokens_not_found(actual_tokens, expected_tokens)
+    alignment = _transcription_token_alignment(
+        expected_tokens,
+        actual_tokens,
+        similarity,
+    )
+    recall = float(alignment["recall"])
+    raw_recall = float(alignment["raw_recall"])
+    missing_tokens = list(alignment["missing_tokens"])
+    extra_tokens = list(alignment["extra_tokens"])
     normalized_divergences = _normalized_legal_divergences(
         list(expected_result["references"]),
         list(actual_result["references"]),
     )
+    normalized_divergences.extend(alignment["phonetic_equivalences"])
     similarity_threshold = max(0.78, float(threshold) - 0.08)
+    critical_missing_tokens = [
+        token for token in missing_tokens
+        if token.isdigit() or len(token) >= 5
+    ]
     approved = (
         recall >= float(threshold)
         and similarity >= similarity_threshold
+        and not critical_missing_tokens
     )
 
     return {
         "approved": approved,
         "similarity": similarity,
         "recall": recall,
+        "raw_recall": raw_recall,
         "similarity_threshold": similarity_threshold,
         "recall_threshold": float(threshold),
         "expected_normalized": expected_text,
         "recognized_normalized": actual_text,
         "missing_expected_tokens": missing_tokens,
+        "critical_missing_tokens": critical_missing_tokens,
         "extra_recognized_tokens": extra_tokens,
         "normalized_divergences": normalized_divergences,
         "equivalent_representation": bool(normalized_divergences),
-        "material_omission": bool(missing_tokens) and recall < float(threshold),
+        "material_omission": bool(critical_missing_tokens) or (
+            bool(missing_tokens) and recall < float(threshold)
+        ),
     }
 
 
@@ -1613,6 +2179,14 @@ def capabilities() -> dict[str, Any]:
         ChatterboxMultilingualTTS.from_pretrained
     )
     supports_explicit_model = "t3_model" in loader_signature.parameters
+    generate_signature = inspect.signature(ChatterboxMultilingualTTS.generate)
+    generate_parameters = sorted(generate_signature.parameters)
+    analyzer_guard_parameters = {
+        "token_repetition_threshold",
+        "alignment_repetition_threshold",
+        "stop_on_eos",
+        "stopping_criteria",
+    }
     effective_model = (
         _LOADED_MODEL_VERSION
         or (MODEL_VERSION if supports_explicit_model else "default-compatible")
@@ -1620,7 +2194,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.4.3",
+        "version": "5.4.6",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {effective_model}",
@@ -1655,11 +2229,32 @@ def capabilities() -> dict[str, Any]:
         "contextual_legal_validation": True,
         "validation_token_diagnostics": True,
         "adaptive_incomplete_chunk_fallback": True,
+        "recursive_semantic_fallback": True,
+        "legal_complexity_chunking": True,
+        "approved_subchunk_temporary_cache": True,
+        "generation_diagnostics_v2": True,
+        "chatterbox_public_generate_parameters": generate_parameters,
+        "token_repetition_guard_configurable": bool(
+            analyzer_guard_parameters.intersection(generate_parameters)
+        ),
+        "chatterbox_log_capture": True,
+        "early_eos_duration_detection": True,
+        "token_repetition_retry_strategy": True,
+        "failure_reason_classification": True,
+        "chatterbox_internal_guard_modified": False,
+        "adaptive_fallback_max_depth": MAX_ADAPTIVE_FALLBACK_DEPTH,
+        "adaptive_fallback_min_chars": int(clamp(
+            MIN_TTS_SUBCHUNK_CHARS,
+            60,
+            110,
+        )),
         "safe_tts_fallback_chars": int(clamp(
             SAFE_TTS_FALLBACK_CHARS,
             120,
             220,
         )),
+        "spoken_roman_legal_headings": True,
+        "guarded_asr_phonetic_alignment": True,
     }
 
 
@@ -2102,24 +2697,57 @@ def _set_generation_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
-def _split_incomplete_chunk_for_fallback(value: str) -> list[str]:
-    """Divide apenas um chunk comprovadamente incompleto, sem perder palavras."""
-    safe_limit = int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))
-    raw_parts = split_long_unit(str(value or "").strip(), safe_limit)
-    merged = merge_tiny_chunks(
-        [(part, False) for part in raw_parts],
-        minimum_chars=45,
-        maximum_chars=safe_limit,
+def _split_incomplete_chunk_for_fallback(
+    value: str,
+    depth: int = 0,
+) -> list[str]:
+    """Subdivide recursivamente em limites jurídicos, sem perder palavras."""
+    base_limit = int(clamp(SAFE_TTS_FALLBACK_CHARS, 100, 220))
+    minimum_limit = int(clamp(MIN_TTS_SUBCHUNK_CHARS, 60, 110))
+    safe_limit = max(
+        minimum_limit,
+        int(round(base_limit * (0.75 ** max(0, int(depth))))),
     )
-    parts = [part for part, _ in merged if is_valid_generation_chunk(part)]
+    parts = split_legal_semantic_chunk(str(value or "").strip(), safe_limit)
     if len(parts) <= 1:
         return []
     validate_chunk_integrity(value, [(part, False) for part in parts])
     return parts
 
 
+def _fallback_join_pause_ms(
+    next_text: str,
+    settings: dict[str, Any],
+) -> float:
+    kind = _leading_legal_structure(next_text)
+    if kind == "heading":
+        return float(clamp(
+            float(settings.get("pause_paragraph_ms", 430)),
+            240,
+            460,
+        ))
+    if kind == "article":
+        return float(clamp(
+            float(settings.get("pause_sentence_ms", 220)),
+            170,
+            300,
+        ))
+    if kind in {"paragraph", "inciso", "alinea"}:
+        return float(clamp(
+            float(settings.get("pause_colon_ms", 180)),
+            110,
+            230,
+        ))
+    return float(clamp(
+        float(settings.get("pause_continuation_ms", 110)),
+        70,
+        160,
+    ))
+
+
 def _assemble_fallback_audio_parts(
     audio_parts: list[torch.Tensor],
+    text_parts: list[str],
     sample_rate: int,
     settings: dict[str, Any],
 ) -> torch.Tensor:
@@ -2129,7 +2757,6 @@ def _assemble_fallback_audio_parts(
 
     output: list[torch.Tensor] = []
     previous_trailing_ms = 0.0
-    desired_pause_ms = float(settings.get("pause_continuation_ms", 110))
 
     for part_index, audio in enumerate(audio_parts):
         prepared, metrics = prepare_audio_for_join(
@@ -2138,6 +2765,10 @@ def _assemble_fallback_audio_parts(
             settings,
         )
         if part_index:
+            desired_pause_ms = _fallback_join_pause_ms(
+                text_parts[part_index],
+                settings,
+            )
             existing_pause_ms = (
                 previous_trailing_ms + metrics["leadingSilenceMs"]
             )
@@ -2156,6 +2787,139 @@ def _assemble_fallback_audio_parts(
     return torch.cat(output, dim=1).contiguous()
 
 
+def _validation_failure_reason(validation: dict[str, Any] | None) -> str:
+    if not validation:
+        return "falha_de_geracao_sem_transcricao_valida"
+    if validation.get("material_omission"):
+        return "omissao_material"
+    if validation.get("critical_missing_tokens"):
+        return "tokens_criticos_ausentes"
+    if float(validation.get("recall", 0.0)) < float(
+        validation.get("recall_threshold", 1.0)
+    ):
+        return "recall_abaixo_do_limite"
+    if float(validation.get("similarity", 0.0)) < float(
+        validation.get("similarity_threshold", 1.0)
+    ):
+        return "similaridade_abaixo_do_limite"
+    return "validacao_reprovada"
+
+
+def _audio_duration_seconds(audio: torch.Tensor, sample_rate: int) -> float:
+    try:
+        samples = int(audio.shape[-1])
+        return max(0.0, samples / max(1, int(sample_rate)))
+    except Exception:
+        return 0.0
+
+
+def _estimated_speech_duration(text: str) -> dict[str, float | int | bool]:
+    words = len(re.findall(r"\b[\wÀ-ÿ]+\b", str(text or ""), re.UNICODE))
+    wpm = float(clamp(EARLY_EOS_NARRATION_WPM, 120, 210))
+    estimated = words * 60.0 / wpm
+    minimum = max(
+        1.2,
+        estimated * float(clamp(EARLY_EOS_MIN_DURATION_RATIO, 0.30, 0.60)),
+    )
+    return {
+        "words": words,
+        "estimated_seconds": estimated,
+        "minimum_reasonable_seconds": minimum,
+        "duration_check_enabled": words >= int(clamp(
+            EARLY_EOS_MIN_WORDS,
+            8,
+            20,
+        )),
+    }
+
+
+def _retry_sampling_parameters(
+    *,
+    attempt_index: int,
+    previous_failure_reason: str,
+    temperature: float,
+    exaggeration: float,
+    cfg_weight: float,
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+) -> dict[str, float]:
+    """Variações pequenas para o retry; a primeira tentativa fica intacta."""
+    if attempt_index <= 1:
+        temperature_delta = 0.0
+        cfg_delta = 0.0
+        repetition_delta = 0.0
+        min_p_delta = 0.0
+    elif previous_failure_reason == "early_eos_token_repetition":
+        # Libera discretamente a amostragem sem descaracterizar a voz.
+        temperature_delta = 0.06 if attempt_index == 2 else 0.08
+        cfg_delta = -0.06 if attempt_index == 2 else -0.10
+        repetition_delta = 0.08 if attempt_index == 2 else 0.10
+        min_p_delta = 0.01
+    else:
+        # Este hotfix não muda a calibração para falhas comuns de ASR/TTS.
+        temperature_delta = 0.0
+        cfg_delta = 0.0
+        repetition_delta = 0.0
+        min_p_delta = 0.0
+
+    return {
+        "temperature": float(clamp(
+            temperature + temperature_delta,
+            0.10,
+            0.68,
+        )),
+        "exaggeration": float(clamp(exaggeration, 0.0, 1.0)),
+        "cfg_weight": float(clamp(cfg_weight + cfg_delta, 0.42, 1.0)),
+        "repetition_penalty": float(clamp(
+            repetition_penalty + repetition_delta,
+            1.0,
+            1.36,
+        )),
+        "min_p": float(clamp(min_p + min_p_delta, 0.01, 0.10)),
+        "top_p": float(clamp(top_p, 0.80, 1.0)),
+    }
+
+
+def _has_numeric_substitution(validation: dict[str, Any] | None) -> bool:
+    if not validation:
+        return False
+    missing = [str(token) for token in validation.get(
+        "critical_missing_tokens", []
+    )]
+    extras = [str(token) for token in validation.get(
+        "extra_recognized_tokens", []
+    )]
+    missing_numbers = {token for token in missing if token.isdigit()}
+    extra_numbers = {token for token in extras if token.isdigit()}
+    return bool(missing_numbers and extra_numbers and missing_numbers != extra_numbers)
+
+
+def _classify_generation_failure(
+    validation: dict[str, Any] | None,
+    *,
+    token_repetition: bool = False,
+    early_eos_suspected: bool = False,
+    generation_exception: bool = False,
+) -> str:
+    if token_repetition and (
+        early_eos_suspected
+        or bool(validation and validation.get("material_omission"))
+    ):
+        return "early_eos_token_repetition"
+    if generation_exception:
+        return "generation_exception"
+    if _has_numeric_substitution(validation):
+        return "numeric_substitution"
+    if validation and validation.get("material_omission"):
+        return "real_content_omission"
+    if validation and not validation.get("approved") and not validation.get(
+        "critical_missing_tokens"
+    ):
+        return "asr_minor_divergence"
+    return "unknown"
+
+
 def generate_chunk_with_retry(
     model: ChatterboxMultilingualTTS,
     chunk: str,
@@ -2169,6 +2933,11 @@ def generate_chunk_with_retry(
     _allow_safe_fallback: bool = True,
     _fallback_label: str = "",
     _seed_offset: int = 0,
+    _fallback_depth: int = 0,
+    _subchunk_index: int = 0,
+    _subchunk_total: int = 0,
+    _approved_subchunk_cache: dict[str, torch.Tensor] | None = None,
+    _reference_hash: str = "",
 ) -> torch.Tensor:
     """
     Gera um chunk com a mesma identidade vocal e, quando habilitado,
@@ -2186,6 +2955,18 @@ def generate_chunk_with_retry(
     verify_each_chunk = bool(settings.get("verify_each_chunk", True))
     verify_threshold = float(settings.get("chunk_verify_threshold", 0.90))
     max_attempts = int(settings.get("chunk_verify_attempts", 3))
+    complexity = legal_chunk_complexity(candidate)
+    mode = "normal" if _fallback_depth == 0 else "subchunk"
+    subchunk_label = (
+        f"{_subchunk_index}/{_subchunk_total}"
+        if _subchunk_index and _subchunk_total
+        else None
+    )
+    approved_subchunk_cache = (
+        _approved_subchunk_cache
+        if _approved_subchunk_cache is not None
+        else {}
+    )
 
     stability = float(settings.get("stability", 0.90))
     fidelity = float(settings.get("voice_fidelity", 0.93))
@@ -2224,11 +3005,21 @@ def generate_chunk_with_retry(
     last_similarity = 0.0
     last_recall = 0.0
     last_validation: dict[str, Any] | None = None
+    last_failure_reason = "unknown"
+    last_generation_diagnostics: dict[str, Any] = {}
+    attempts_executed = 0
 
     for attempt_index in range(1, max_attempts + 1):
+        attempts_executed = attempt_index
+        chatterbox_logs: _ChatterboxGenerationLogCapture | None = None
         try:
-            # Muda apenas a semente para permitir nova tentativa; a identidade vocal
-            # e os parâmetros permanecem fixos.
+            # A segunda tentativa reforça apenas a pontuação de fala. Nenhuma
+            # palavra ou parâmetro da voz é alterado.
+            attempt_candidate = (
+                candidate
+                if attempt_index == 1
+                else punctuate_legal_speech_structure(candidate)
+            )
             seed = (
                 int(settings.get("voice_seed", 1701))
                 + chunk_index * 1009
@@ -2237,34 +3028,128 @@ def generate_chunk_with_retry(
             )
             _set_generation_seed(seed)
 
-            print(
-                f"[CTEC] Trecho {chunk_index}/{total_chunks}, "
-                f"fallback={_fallback_label or 'none'} | "
-                f"tentativa {attempt_index}/{max_attempts}: {candidate[:180]!r} | "
-                f"fidelity_mode={str(fidelity_mode).lower()} | "
-                f"temperature={effective_temperature:.3f} | "
-                f"exaggeration={effective_exaggeration:.3f} | "
-                f"cfg={effective_cfg:.3f}",
-                flush=True,
-            )
-
-            audio = model.generate(
-                candidate,
-                language_id=language_id,
-                audio_prompt_path=str(reference_path),
+            attempt_parameters = _retry_sampling_parameters(
+                attempt_index=attempt_index,
+                previous_failure_reason=last_failure_reason,
+                temperature=effective_temperature,
                 exaggeration=effective_exaggeration,
                 cfg_weight=effective_cfg,
-                temperature=effective_temperature,
                 repetition_penalty=float(settings["repetition_penalty"]),
                 min_p=float(settings["min_p"]),
                 top_p=float(settings["top_p"]),
-            ).detach().cpu()
+            )
+
+            print(
+                f"[CTEC] Trecho {chunk_index}/{total_chunks}, "
+                f"modo={mode} | fallback={_fallback_label or 'none'} | "
+                f"subchunk={subchunk_label or 'none'} | "
+                f"complexidade={complexity['level']} | "
+                f"tentativa {attempt_index}/{max_attempts}: {attempt_candidate[:180]!r} | "
+                f"fidelity_mode={str(fidelity_mode).lower()} | "
+                f"temperature={attempt_parameters['temperature']:.3f} | "
+                f"exaggeration={attempt_parameters['exaggeration']:.3f} | "
+                f"cfg={attempt_parameters['cfg_weight']:.3f} | "
+                f"repetition_penalty={attempt_parameters['repetition_penalty']:.3f}",
+                flush=True,
+            )
+
+            with _capture_chatterbox_generation_logs() as chatterbox_logs:
+                audio = model.generate(
+                    attempt_candidate,
+                    language_id=language_id,
+                    audio_prompt_path=str(reference_path),
+                    exaggeration=attempt_parameters["exaggeration"],
+                    cfg_weight=attempt_parameters["cfg_weight"],
+                    temperature=attempt_parameters["temperature"],
+                    repetition_penalty=attempt_parameters[
+                        "repetition_penalty"
+                    ],
+                    min_p=attempt_parameters["min_p"],
+                    top_p=attempt_parameters["top_p"],
+                ).detach().cpu()
 
             if audio.numel() == 0:
                 raise RuntimeError("O modelo devolveu um tensor de áudio vazio.")
 
             if audio.ndim == 1:
                 audio = audio.unsqueeze(0)
+
+            duration_seconds = _audio_duration_seconds(audio, model.sr)
+            duration_estimate = _estimated_speech_duration(attempt_candidate)
+            early_eos_suspected = bool(
+                duration_estimate["duration_check_enabled"]
+                and duration_seconds > 0.0
+                and duration_seconds
+                < float(duration_estimate["minimum_reasonable_seconds"])
+            )
+            analyzer_diagnostics = chatterbox_logs.as_dict()
+            token_repetition_eos = bool(
+                analyzer_diagnostics["token_repetition"]
+            )
+            last_generation_diagnostics = {
+                "chunk_original": f"{chunk_index}/{total_chunks}",
+                "modo": mode,
+                "subchunk": subchunk_label,
+                "profundidade_fallback": _fallback_depth,
+                "texto_enviado": attempt_candidate[:1000],
+                "caracteres": len(attempt_candidate),
+                "palavras": duration_estimate["words"],
+                "token_repetido": analyzer_diagnostics["repeated_token"],
+                "repeticoes_detectadas": analyzer_diagnostics[
+                    "repetition_count"
+                ],
+                "passo_eos": analyzer_diagnostics["eos_step"],
+                "token_repetition": analyzer_diagnostics["token_repetition"],
+                "long_tail": analyzer_diagnostics["long_tail"],
+                "alignment_repetition": analyzer_diagnostics[
+                    "alignment_repetition"
+                ],
+                "eos_detectado": analyzer_diagnostics["eos_detected"],
+                "duracao_produzida_s": round(duration_seconds, 3),
+                "duracao_estimada_s": round(float(
+                    duration_estimate["estimated_seconds"]
+                ), 3),
+                "duracao_minima_razoavel_s": round(float(
+                    duration_estimate["minimum_reasonable_seconds"]
+                ), 3),
+                "early_eos_suspected": early_eos_suspected,
+                "temperature": attempt_parameters["temperature"],
+                "exaggeration": attempt_parameters["exaggeration"],
+                "cfg": attempt_parameters["cfg_weight"],
+                "repetition_penalty": attempt_parameters[
+                    "repetition_penalty"
+                ],
+                "min_p": attempt_parameters["min_p"],
+                "top_p": attempt_parameters["top_p"],
+                "referencia_voz_hash": _reference_hash or "unknown",
+                "logs_analisador": analyzer_diagnostics["messages"],
+            }
+            print(
+                "[CTEC] Diagnóstico da geração: "
+                + json.dumps(last_generation_diagnostics, ensure_ascii=False),
+                flush=True,
+            )
+
+            # Só pula o Whisper quando há evidência conjunta: o próprio
+            # Chatterbox declarou token_repetition e a duração é inviável.
+            # Isso nunca aprova áudio; apenas escolhe o retry/fallback correto.
+            if token_repetition_eos and early_eos_suspected:
+                last_failure_reason = "early_eos_token_repetition"
+                last_error = RuntimeError(
+                    "EOS precoce provocado por repetição de token."
+                )
+                can_subdivide_after_retry = (
+                    _allow_safe_fallback
+                    and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
+                    and len(candidate) > int(clamp(
+                        MIN_TTS_SUBCHUNK_CHARS,
+                        60,
+                        110,
+                    ))
+                )
+                if attempt_index >= min(2, max_attempts) and can_subdivide_after_retry:
+                    break
+                continue
 
             if verify_each_chunk and get_whisper() is not None:
                 verify_root = verification_dir or reference_path.parent
@@ -2298,6 +3183,15 @@ def generate_chunk_with_retry(
                     validation["equivalent_representation"]
                 )
                 approved = bool(validation["approved"])
+                classified_failure_reason = (
+                    "unknown" if approved else _classify_generation_failure(
+                        validation,
+                        token_repetition=token_repetition_eos,
+                        early_eos_suspected=early_eos_suspected,
+                    )
+                )
+                if not approved:
+                    last_failure_reason = classified_failure_reason
 
                 print(
                     "[CTEC] Verificação Whisper: "
@@ -2313,20 +3207,48 @@ def generate_chunk_with_retry(
                 print(
                     "[CTEC] Diagnóstico da validação: "
                     + json.dumps({
-                        "chunk": f"{chunk_index}/{total_chunks}",
-                        "attempt": attempt_index,
-                        "expectedNormalized": validation["expected_normalized"],
-                        "recognizedNormalized": validation["recognized_normalized"],
-                        "missingExpectedTokens": validation[
+                        "chunk_original": f"{chunk_index}/{total_chunks}",
+                        "modo": mode,
+                        "subchunk": subchunk_label,
+                        "profundidade_fallback": _fallback_depth,
+                        "caracteres": len(candidate),
+                        "palavras": len(candidate.split()),
+                        "complexidade": complexity["level"],
+                        "pontuacao_complexidade": complexity["score"],
+                        "tentativa": f"{attempt_index}/{max_attempts}",
+                        "similaridade": round(similarity, 6),
+                        "recall": round(recall, 6),
+                        "omissao_material": validation["material_omission"],
+                        "texto_esperado": candidate[:600],
+                        "transcricao": transcript[:600],
+                        "motivo_reprovacao": (
+                            None if approved
+                            else _validation_failure_reason(validation)
+                        ),
+                        "failure_reason": (
+                            None if approved else classified_failure_reason
+                        ),
+                        "early_eos_suspected": early_eos_suspected,
+                        "token_repetition": token_repetition_eos,
+                        "token_repetido": analyzer_diagnostics[
+                            "repeated_token"
+                        ],
+                        "passo_eos": analyzer_diagnostics["eos_step"],
+                        "raw_recall": validation["raw_recall"],
+                        "esperado_normalizado": validation["expected_normalized"],
+                        "reconhecido_normalizado": validation["recognized_normalized"],
+                        "tokens_esperados_nao_encontrados": validation[
                             "missing_expected_tokens"
                         ],
-                        "extraRecognizedTokens": validation[
+                        "tokens_criticos_nao_encontrados": validation[
+                            "critical_missing_tokens"
+                        ],
+                        "tokens_extras_reconhecidos": validation[
                             "extra_recognized_tokens"
                         ],
-                        "normalizedDivergences": validation[
+                        "divergencias_normalizadas": validation[
                             "normalized_divergences"
                         ],
-                        "materialOmission": validation["material_omission"],
                     }, ensure_ascii=False),
                     flush=True,
                 )
@@ -2340,32 +3262,86 @@ def generate_chunk_with_retry(
                     last_error = RuntimeError(
                         "O trecho gerado não reproduziu todo o texto esperado."
                     )
+                    can_subdivide = (
+                        _allow_safe_fallback
+                        and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
+                        and len(candidate) > int(clamp(
+                            MIN_TTS_SUBCHUNK_CHARS,
+                            60,
+                            110,
+                        ))
+                    )
+                    # Duas ocorrências confirmadas de EOS por repetição vão para
+                    # subdivisão. Omissão real complexa também não é repetida
+                    # três vezes; subchunks continuam sujeitos ao validador.
+                    if (
+                        can_subdivide
+                        and (
+                            (
+                                classified_failure_reason
+                                == "early_eos_token_repetition"
+                                and attempt_index >= min(2, max_attempts)
+                            )
+                            or (
+                                bool(validation.get("material_omission"))
+                                and (
+                                    complexity["level"] == "alta"
+                                    or attempt_index >= min(2, max_attempts)
+                                )
+                            )
+                        )
+                    ):
+                        break
                     continue
 
             return audio
 
         except (IndexError, RuntimeError) as error:
             last_error = error
+            captured_exception_logs = (
+                chatterbox_logs.as_dict()
+                if chatterbox_logs is not None
+                else {}
+            )
+            exception_token_repetition = bool(
+                captured_exception_logs.get("token_repetition")
+            )
+            last_failure_reason = _classify_generation_failure(
+                last_validation,
+                token_repetition=exception_token_repetition,
+                early_eos_suspected=exception_token_repetition,
+                generation_exception=not exception_token_repetition,
+            )
             print(
                 f"[CTEC] Falha no trecho {chunk_index}/{total_chunks}, "
                 f"fallback={_fallback_label or 'none'}, "
-                f"tentativa {attempt_index}: {type(error).__name__}: {error}",
+                f"tentativa {attempt_index}: {type(error).__name__}: {error} | "
+                f"failure_reason={last_failure_reason}",
                 flush=True,
             )
 
-    if (
+    can_fallback = (
         _allow_safe_fallback
-        and last_validation is not None
-        and bool(last_validation.get("material_omission"))
-        and len(candidate) > int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))
-    ):
-        fallback_parts = _split_incomplete_chunk_for_fallback(candidate)
+        and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
+        and len(candidate) > int(clamp(MIN_TTS_SUBCHUNK_CHARS, 60, 110))
+        and (
+            last_validation is None
+            or not bool(last_validation.get("approved"))
+        )
+    )
+    if can_fallback:
+        fallback_parts = _split_incomplete_chunk_for_fallback(
+            candidate,
+            depth=_fallback_depth,
+        )
         if fallback_parts:
             print(
                 "[CTEC] Fallback adaptativo ativado: "
                 f"chunk={chunk_index}/{total_chunks} | "
+                f"depth={_fallback_depth + 1}/{MAX_ADAPTIVE_FALLBACK_DEPTH} | "
+                f"reason={last_failure_reason} | "
                 f"parts={len(fallback_parts)} | "
-                f"limit={int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))}",
+                f"complexity={complexity['level']}",
                 flush=True,
             )
             fallback_audio: list[torch.Tensor] = []
@@ -2375,34 +3351,52 @@ def generate_chunk_with_retry(
                     start=1,
                 ):
                     generation_part = fallback_part
-                    if (
-                        part_index < len(fallback_parts)
-                        and not re.search(r"[,;:.!?]$", generation_part)
-                    ):
-                        generation_part += ","
-                    fallback_audio.append(generate_chunk_with_retry(
-                        model,
-                        generation_part,
-                        language_id=language_id,
-                        reference_path=reference_path,
-                        settings=settings,
-                        chunk_index=chunk_index,
-                        total_chunks=total_chunks,
-                        verification_dir=verification_dir,
-                        _allow_safe_fallback=False,
-                        _fallback_label=(
-                            f"part_{part_index}_of_{len(fallback_parts)}"
-                        ),
-                        _seed_offset=part_index * 100003,
-                    ))
+                    cache_key = hashlib.sha256(
+                        (
+                            f"{chunk_index}|{_fallback_depth + 1}|"
+                            f"{part_index}|{generation_part}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if cache_key in approved_subchunk_cache:
+                        part_audio = approved_subchunk_cache[cache_key]
+                        print(
+                            "[CTEC] Subchunk aprovado reutilizado do cache "
+                            f"temporário: {part_index}/{len(fallback_parts)}",
+                            flush=True,
+                        )
+                    else:
+                        part_audio = generate_chunk_with_retry(
+                            model,
+                            generation_part,
+                            language_id=language_id,
+                            reference_path=reference_path,
+                            settings=settings,
+                            chunk_index=chunk_index,
+                            total_chunks=total_chunks,
+                            verification_dir=verification_dir,
+                            _allow_safe_fallback=True,
+                            _fallback_label=(
+                                f"part_{part_index}_of_{len(fallback_parts)}"
+                            ),
+                            _seed_offset=part_index * 100003,
+                            _fallback_depth=_fallback_depth + 1,
+                            _subchunk_index=part_index,
+                            _subchunk_total=len(fallback_parts),
+                            _approved_subchunk_cache=approved_subchunk_cache,
+                            _reference_hash=_reference_hash,
+                        )
+                        approved_subchunk_cache[cache_key] = part_audio
+                    fallback_audio.append(part_audio)
                 joined = _assemble_fallback_audio_parts(
                     fallback_audio,
+                    fallback_parts,
                     model.sr,
                     settings,
                 )
                 print(
                     "[CTEC] Fallback adaptativo aprovado: "
                     f"chunk={chunk_index}/{total_chunks} | "
+                    f"depth={_fallback_depth + 1} | "
                     f"parts={len(fallback_parts)}",
                     flush=True,
                 )
@@ -2424,10 +3418,15 @@ def generate_chunk_with_retry(
                 "tokens_extras_reconhecidos": last_validation[
                     "extra_recognized_tokens"
                 ],
+                "tokens_criticos_nao_encontrados": last_validation[
+                    "critical_missing_tokens"
+                ],
                 "divergencias_normalizadas": last_validation[
                     "normalized_divergences"
                 ],
                 "omissao_material": last_validation["material_omission"],
+                "failure_reason": last_failure_reason,
+                "diagnostico_geracao": last_generation_diagnostics,
             }
         details = (
             f" Similaridade final: {last_similarity:.3f}; "
@@ -2440,7 +3439,11 @@ def generate_chunk_with_retry(
 
     raise RuntimeError(
         f"O Chatterbox não conseguiu gerar corretamente o trecho "
-        f"{chunk_index}/{total_chunks} após {max_attempts} tentativas. "
+        f"{chunk_index}/{total_chunks} após {attempts_executed} tentativas. "
+        f"Modo: {mode}; subchunk: {subchunk_label or 'não'}; "
+        f"caracteres: {len(candidate)}; palavras: {len(candidate.split())}; "
+        f"complexidade: {complexity['level']}; "
+        f"failure_reason: {last_failure_reason}; "
         f"Trecho esperado: {candidate[:220]!r}. "
         f"Erro final: {last_error}.{details}"
     )
@@ -2510,11 +3513,19 @@ def generate_long_project(
         raw_chunks,
         maximum_chars=int(settings["chunk_limit"]),
     )
+    chunks_before_adaptive = len(chunks)
+    if settings.get("text_mode") == "law":
+        chunks = adapt_chunks_for_legal_complexity(
+            chunks,
+            int(settings["chunk_limit"]),
+        )
     if not chunks:
         raise ValueError("Nenhum trecho válido foi produzido.")
     integrity = validate_chunk_integrity(prepared, chunks)
     integrity["chunks_before_merge"] = chunks_before_merge
-    integrity["chunks_after_merge"] = len(chunks)
+    integrity["chunks_after_merge"] = chunks_before_adaptive
+    integrity["chunks_before_adaptive"] = chunks_before_adaptive
+    integrity["chunks_after_adaptive"] = len(chunks)
 
     mp3_bitrate = str(data.get("mp3_bitrate") or "160k").strip().lower()
     if mp3_bitrate not in {"96k", "128k", "160k", "192k", "256k", "320k"}:
@@ -2571,6 +3582,7 @@ def generate_long_project(
                     chunk_index=index,
                     total_chunks=total,
                     verification_dir=root / "verification",
+                    _reference_hash=ref_hash,
                 )
                 seam = assembler.add(audio, chunk, paragraph_end)
                 marker_list.append({
@@ -2728,13 +3740,21 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         raw_chunks,
         maximum_chars=int(settings["chunk_limit"]),
     )
+    chunks_before_adaptive = len(chunks)
+    if settings.get("text_mode") == "law":
+        chunks = adapt_chunks_for_legal_complexity(
+            chunks,
+            int(settings["chunk_limit"]),
+        )
     if not chunks:
         raise ValueError(
             "O texto não gerou nenhum trecho válido depois da preparação jurídica."
         )
     integrity = validate_chunk_integrity(text, chunks)
     integrity["chunks_before_merge"] = chunks_before_merge
-    integrity["chunks_after_merge"] = len(chunks)
+    integrity["chunks_after_merge"] = chunks_before_adaptive
+    integrity["chunks_before_adaptive"] = chunks_before_adaptive
+    integrity["chunks_after_adaptive"] = len(chunks)
 
     output_format = str(data.get("output_format") or "mp3").strip().lower()
     if output_format not in {"mp3", "wav"}:
@@ -2781,6 +3801,7 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                     chunk_index=index,
                     total_chunks=total,
                     verification_dir=root / "verification",
+                    _reference_hash=ref_hash,
                 )
                 assembler.add(audio, chunk, paragraph_end)
 
@@ -2843,6 +3864,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.3...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.6...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo solicitado: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
