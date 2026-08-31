@@ -36,6 +36,7 @@ MODEL_VERSION = os.getenv("CTEC_CHATTERBOX_MODEL", "v3").strip().lower() or "v3"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
 MAX_REFERENCE_BYTES = int(os.getenv("CTEC_MAX_REFERENCE_BYTES", str(30 * 1024 * 1024)))
 MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 * 1024 * 1024)))
+SAFE_TTS_FALLBACK_CHARS = int(os.getenv("CTEC_SAFE_TTS_FALLBACK_CHARS", "140"))
 WORKER_CONTRACT_VERSION = 2
 
 _MODEL: ChatterboxMultilingualTTS | None = None
@@ -1619,7 +1620,7 @@ def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
         "worker": "CTEC Estúdio de Voz",
-        "version": "5.4.2",
+        "version": "5.4.3",
         "contract_version": WORKER_CONTRACT_VERSION,
         "device": DEVICE,
         "model": f"Chatterbox Multilingual {effective_model}",
@@ -1653,6 +1654,12 @@ def capabilities() -> dict[str, Any]:
         "whisper_numeric_equivalence": True,
         "contextual_legal_validation": True,
         "validation_token_diagnostics": True,
+        "adaptive_incomplete_chunk_fallback": True,
+        "safe_tts_fallback_chars": int(clamp(
+            SAFE_TTS_FALLBACK_CHARS,
+            120,
+            220,
+        )),
     }
 
 
@@ -2095,6 +2102,60 @@ def _set_generation_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
+def _split_incomplete_chunk_for_fallback(value: str) -> list[str]:
+    """Divide apenas um chunk comprovadamente incompleto, sem perder palavras."""
+    safe_limit = int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))
+    raw_parts = split_long_unit(str(value or "").strip(), safe_limit)
+    merged = merge_tiny_chunks(
+        [(part, False) for part in raw_parts],
+        minimum_chars=45,
+        maximum_chars=safe_limit,
+    )
+    parts = [part for part, _ in merged if is_valid_generation_chunk(part)]
+    if len(parts) <= 1:
+        return []
+    validate_chunk_integrity(value, [(part, False) for part in parts])
+    return parts
+
+
+def _assemble_fallback_audio_parts(
+    audio_parts: list[torch.Tensor],
+    sample_rate: int,
+    settings: dict[str, Any],
+) -> torch.Tensor:
+    """Une subpartes validadas em PCM, com pausa curta e sem nova codificação."""
+    if not audio_parts:
+        raise RuntimeError("O fallback não produziu nenhuma parte de áudio.")
+
+    output: list[torch.Tensor] = []
+    previous_trailing_ms = 0.0
+    desired_pause_ms = float(settings.get("pause_continuation_ms", 110))
+
+    for part_index, audio in enumerate(audio_parts):
+        prepared, metrics = prepare_audio_for_join(
+            audio,
+            sample_rate,
+            settings,
+        )
+        if part_index:
+            existing_pause_ms = (
+                previous_trailing_ms + metrics["leadingSilenceMs"]
+            )
+            missing_pause_ms = max(0.0, desired_pause_ms - existing_pause_ms)
+            silence_samples = int(round(
+                sample_rate * missing_pause_ms / 1000.0
+            ))
+            if silence_samples:
+                output.append(torch.zeros(
+                    (1, silence_samples),
+                    dtype=prepared.dtype,
+                ))
+        output.append(prepared)
+        previous_trailing_ms = metrics["trailingSilenceMs"]
+
+    return torch.cat(output, dim=1).contiguous()
+
+
 def generate_chunk_with_retry(
     model: ChatterboxMultilingualTTS,
     chunk: str,
@@ -2105,6 +2166,9 @@ def generate_chunk_with_retry(
     chunk_index: int,
     total_chunks: int,
     verification_dir: Path | None = None,
+    _allow_safe_fallback: bool = True,
+    _fallback_label: str = "",
+    _seed_offset: int = 0,
 ) -> torch.Tensor:
     """
     Gera um chunk com a mesma identidade vocal e, quando habilitado,
@@ -2169,11 +2233,13 @@ def generate_chunk_with_retry(
                 int(settings.get("voice_seed", 1701))
                 + chunk_index * 1009
                 + attempt_index * 37
+                + int(_seed_offset)
             )
             _set_generation_seed(seed)
 
             print(
                 f"[CTEC] Trecho {chunk_index}/{total_chunks}, "
+                f"fallback={_fallback_label or 'none'} | "
                 f"tentativa {attempt_index}/{max_attempts}: {candidate[:180]!r} | "
                 f"fidelity_mode={str(fidelity_mode).lower()} | "
                 f"temperature={effective_temperature:.3f} | "
@@ -2204,7 +2270,9 @@ def generate_chunk_with_retry(
                 verify_root = verification_dir or reference_path.parent
                 verify_root.mkdir(parents=True, exist_ok=True)
                 verify_path = verify_root / (
-                    f"verify_chunk_{chunk_index:05d}_attempt_{attempt_index}.wav"
+                    f"verify_chunk_{chunk_index:05d}"
+                    f"{'_' + _fallback_label if _fallback_label else ''}"
+                    f"_attempt_{attempt_index}.wav"
                 )
                 torchaudio.save(str(verify_path), audio, model.sr)
 
@@ -2280,9 +2348,70 @@ def generate_chunk_with_retry(
             last_error = error
             print(
                 f"[CTEC] Falha no trecho {chunk_index}/{total_chunks}, "
+                f"fallback={_fallback_label or 'none'}, "
                 f"tentativa {attempt_index}: {type(error).__name__}: {error}",
                 flush=True,
             )
+
+    if (
+        _allow_safe_fallback
+        and last_validation is not None
+        and bool(last_validation.get("material_omission"))
+        and len(candidate) > int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))
+    ):
+        fallback_parts = _split_incomplete_chunk_for_fallback(candidate)
+        if fallback_parts:
+            print(
+                "[CTEC] Fallback adaptativo ativado: "
+                f"chunk={chunk_index}/{total_chunks} | "
+                f"parts={len(fallback_parts)} | "
+                f"limit={int(clamp(SAFE_TTS_FALLBACK_CHARS, 120, 220))}",
+                flush=True,
+            )
+            fallback_audio: list[torch.Tensor] = []
+            try:
+                for part_index, fallback_part in enumerate(
+                    fallback_parts,
+                    start=1,
+                ):
+                    generation_part = fallback_part
+                    if (
+                        part_index < len(fallback_parts)
+                        and not re.search(r"[,;:.!?]$", generation_part)
+                    ):
+                        generation_part += ","
+                    fallback_audio.append(generate_chunk_with_retry(
+                        model,
+                        generation_part,
+                        language_id=language_id,
+                        reference_path=reference_path,
+                        settings=settings,
+                        chunk_index=chunk_index,
+                        total_chunks=total_chunks,
+                        verification_dir=verification_dir,
+                        _allow_safe_fallback=False,
+                        _fallback_label=(
+                            f"part_{part_index}_of_{len(fallback_parts)}"
+                        ),
+                        _seed_offset=part_index * 100003,
+                    ))
+                joined = _assemble_fallback_audio_parts(
+                    fallback_audio,
+                    model.sr,
+                    settings,
+                )
+                print(
+                    "[CTEC] Fallback adaptativo aprovado: "
+                    f"chunk={chunk_index}/{total_chunks} | "
+                    f"parts={len(fallback_parts)}",
+                    flush=True,
+                )
+                return joined
+            except RuntimeError as fallback_error:
+                last_error = RuntimeError(
+                    "O fallback adaptativo também falhou: "
+                    f"{fallback_error}"
+                )
 
     details = ""
     if last_transcript:
@@ -2714,6 +2843,6 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.2...", flush=True)
+    print("[CTEC] Iniciando CTEC Estúdio de Voz Worker 5.4.3...", flush=True)
     print(f"[CTEC] Device: {DEVICE} | Modelo solicitado: {MODEL_VERSION}", flush=True)
     runpod.serverless.start({"handler": generate})
