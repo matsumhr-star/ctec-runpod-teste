@@ -562,6 +562,20 @@ def normalize_law_text(
         text,
         flags=re.IGNORECASE,
     )
+
+    # Referência legal brasileira com separador de milhar, por exemplo:
+    # "Lei número 15.121" -> "Lei número quinze mil cento e vinte e um".
+    # A transformação existe apenas na cópia de fala; o texto jurídico original
+    # recebido pelo serviço permanece intacto.
+    text = re.sub(
+        r"\bLei\s+número\s+(\d{1,3}(?:\.\d{3})+)\b",
+        lambda match: (
+            "Lei número "
+            + number_words(int(match.group(1).replace(".", "")))
+        ),
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(
         rf"\b(\d{{1,2}})\s+de\s+({_LEGAL_MONTHS})\s+de\s+(\d{{4}})\b",
         lambda match: (
@@ -804,6 +818,8 @@ def _protected_legal_reference_spans(value: str) -> list[tuple[int, int]]:
         rf"\bInciso\s+{number}",
         rf"\bLei\s+Complementar\s+(?:número\s+)?{number}"
         rf"(?:\s*,?\s*de\s+{number}\s+de\s+(?:{_LEGAL_MONTHS})\s+de\s+{number})?",
+        rf"\bLei\s+(?:número\s+)?(?:\d{1,3}(?:\.\d{3})+|{number})"
+        rf"(?:\s*,?\s*de\s+{number}\s+de\s+(?:{_LEGAL_MONTHS})\s+de\s+{number})?",
         rf"\b{number}\s+de\s+(?:{_LEGAL_MONTHS})\s+de\s+{number}\b",
         r"\b(?:Art|Arts)\.\s*\d+[º°]?",
         r"§\s*\d+[º°]?",
@@ -928,7 +944,10 @@ def split_legal_semantic_chunk(value: str, limit: int) -> list[str]:
     source = re.sub(r"\s+", " ", str(value or "")).strip()
     if not source:
         return []
-    limit = max(int(MIN_TTS_SUBCHUNK_CHARS), int(limit))
+    # O chunking preventivo continua usando seus limites normais. No fallback
+    # recursivo, porém, precisamos permitir microchunks menores quando o próprio
+    # Chatterbox força EOS por token_repetition.
+    limit = max(36, int(limit))
 
     primary = [
         item.strip()
@@ -2701,19 +2720,96 @@ def _split_incomplete_chunk_for_fallback(
     value: str,
     depth: int = 0,
 ) -> list[str]:
-    """Subdivide recursivamente em limites jurídicos, sem perder palavras."""
+    """
+    Subdivide recursivamente em limites jurídicos, sem perder palavras.
+
+    Correção CTEC:
+    - um chunk que falhou por EOS não deixa de ser subdividido só porque já é
+      menor que SAFE_TTS_FALLBACK_CHARS;
+    - cada profundidade reduz de fato o alvo;
+    - referências legais e datas são preservadas;
+    - citações legais entre parênteses recebem fronteiras naturais.
+    """
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not source:
+        return []
+
+    depth = max(0, int(depth))
     base_limit = int(clamp(SAFE_TTS_FALLBACK_CHARS, 100, 220))
-    minimum_limit = int(clamp(MIN_TTS_SUBCHUNK_CHARS, 60, 110))
+    hard_floor = max(36, int(MIN_TTS_SUBCHUNK_CHARS) // 2)
+
     safe_limit = max(
-        minimum_limit,
-        int(round(base_limit * (0.75 ** max(0, int(depth))))),
+        hard_floor,
+        int(round(base_limit * (0.75 ** depth))),
     )
-    parts = split_legal_semantic_chunk(str(value or "").strip(), safe_limit)
+
+    # Caso real: 131 caracteres com fallback=140 retornava uma única parte.
+    # Se o trecho chegou ao fallback, ele já falhou e precisa encolher.
+    if len(source) <= safe_limit and len(source) > hard_floor:
+        safe_limit = max(
+            hard_floor,
+            min(safe_limit, int(round(len(source) * 0.62))),
+        )
+
+    semantic_seed_parts: list[str] = []
+    cursor = 0
+    for match in re.finditer(
+        r"\((\s*Lei\s+(?:Complementar\s+)?número\s+[^()]+)\)",
+        source,
+        flags=re.IGNORECASE,
+    ):
+        prefix = source[cursor:match.start()].strip(" ,;:")
+        if prefix:
+            semantic_seed_parts.append(prefix)
+
+        inside = match.group(1).strip(" ,;:")
+        legal_bits = [
+            bit.strip(" ,;:")
+            for bit in re.split(r",\s+(?=de\s+)", inside, maxsplit=1)
+            if bit.strip(" ,;:")
+        ]
+        semantic_seed_parts.extend(legal_bits)
+        cursor = match.end()
+
+    tail = source[cursor:].strip(" ,;:")
+    if tail:
+        semantic_seed_parts.append(tail)
+
+    if len(semantic_seed_parts) <= 1:
+        semantic_seed_parts = [source]
+
+    parts: list[str] = []
+    for seed_part in semantic_seed_parts:
+        if len(seed_part) <= safe_limit:
+            parts.append(seed_part)
+        else:
+            parts.extend(split_legal_semantic_chunk(seed_part, safe_limit))
+
+    parts = [
+        clean_generation_chunk(part)
+        for part in parts
+        if is_valid_generation_chunk(part)
+    ]
+
+    # Se a divisão semântica ainda não reduziu, força progresso com limite menor,
+    # sempre respeitando os spans de referências jurídicas.
+    if len(parts) <= 1 and len(source) > hard_floor:
+        forced_limit = max(
+            hard_floor,
+            min(len(source) - 1, int(round(len(source) * 0.55))),
+        )
+        forced = _split_oversized_legal_unit(source, forced_limit)
+        parts = [
+            clean_generation_chunk(part)
+            for part in forced
+            if is_valid_generation_chunk(part)
+        ]
+
     if len(parts) <= 1:
         return []
-    validate_chunk_integrity(value, [(part, False) for part in parts])
-    return parts
 
+    validate_chunk_integrity(source, [(part, False) for part in parts])
+    return parts
 
 def _fallback_join_pause_ms(
     next_text: str,
@@ -2902,10 +2998,10 @@ def _classify_generation_failure(
     early_eos_suspected: bool = False,
     generation_exception: bool = False,
 ) -> str:
-    if token_repetition and (
-        early_eos_suspected
-        or bool(validation and validation.get("material_omission"))
-    ):
+    # token_repetition só é marcado quando o próprio Chatterbox registra
+    # "forcing EOS token ... token_repetition=True". Essa evidência interna
+    # tem prioridade sobre a heurística secundária de duração.
+    if token_repetition:
         return "early_eos_token_repetition"
     if generation_exception:
         return "generation_exception"
@@ -3133,7 +3229,7 @@ def generate_chunk_with_retry(
             # Só pula o Whisper quando há evidência conjunta: o próprio
             # Chatterbox declarou token_repetition e a duração é inviável.
             # Isso nunca aprova áudio; apenas escolhe o retry/fallback correto.
-            if token_repetition_eos and early_eos_suspected:
+            if token_repetition_eos:
                 last_failure_reason = "early_eos_token_repetition"
                 last_error = RuntimeError(
                     "EOS precoce provocado por repetição de token."
@@ -3141,11 +3237,10 @@ def generate_chunk_with_retry(
                 can_subdivide_after_retry = (
                     _allow_safe_fallback
                     and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
-                    and len(candidate) > int(clamp(
-                        MIN_TTS_SUBCHUNK_CHARS,
-                        60,
-                        110,
-                    ))
+                    and len(candidate) > max(
+                        36,
+                        int(MIN_TTS_SUBCHUNK_CHARS) // 2,
+                    )
                 )
                 if attempt_index >= min(2, max_attempts) and can_subdivide_after_retry:
                     break
@@ -3265,11 +3360,10 @@ def generate_chunk_with_retry(
                     can_subdivide = (
                         _allow_safe_fallback
                         and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
-                        and len(candidate) > int(clamp(
-                            MIN_TTS_SUBCHUNK_CHARS,
-                            60,
-                            110,
-                        ))
+                        and len(candidate) > max(
+                            36,
+                            int(MIN_TTS_SUBCHUNK_CHARS) // 2,
+                        )
                     )
                     # Duas ocorrências confirmadas de EOS por repetição vão para
                     # subdivisão. Omissão real complexa também não é repetida
@@ -3323,7 +3417,7 @@ def generate_chunk_with_retry(
     can_fallback = (
         _allow_safe_fallback
         and _fallback_depth < MAX_ADAPTIVE_FALLBACK_DEPTH
-        and len(candidate) > int(clamp(MIN_TTS_SUBCHUNK_CHARS, 60, 110))
+        and len(candidate) > max(36, int(MIN_TTS_SUBCHUNK_CHARS) // 2)
         and (
             last_validation is None
             or not bool(last_validation.get("approved"))
