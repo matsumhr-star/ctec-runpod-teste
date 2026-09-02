@@ -1229,11 +1229,16 @@ def prepare_reference_audio(
 
     fidelity_mode = bool((settings or {}).get("voice_clone_fidelity_mode", True))
 
+    # Chatterbox trabalha melhor quando o prompt de voz é curto e limpo.
+    # O worker antigo extraía 22 s de uma referência de vários minutos; isso
+    # criava um conditioning excessivamente longo e, nos logs CTEC, coincidia
+    # com colapso de tokens até em frases de 4 palavras. Mantemos a voz, mas
+    # condicionamos com uma janela curta e estável.
     selected_source, selection_metrics = _select_reference_segment(
         decoded,
         root,
-        target_seconds=22.0 if fidelity_mode else 45.0,
-        max_seconds=30.0 if fidelity_mode else 60.0,
+        target_seconds=10.0 if fidelity_mode else 20.0,
+        max_seconds=12.0 if fidelity_mode else 30.0,
     )
 
     try:
@@ -1384,22 +1389,28 @@ def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
         base[key] = int(base[key])
     base["chunk_target"] = min(base["chunk_target"], base["chunk_limit"])
 
-    # Modo de clonagem fiel: prioriza a identidade da referência e reduz
-    # aleatoriedade/expressividade que podem afastar o timbre do original.
+    # IMPORTANTE: fidelidade da voz e sampling do T3 são coisas diferentes.
+    # A versão anterior transformava "fidelidade" em temperature muito baixa
+    # e CFG alto (<=0.56 / >=0.62). Isso afastava o motor do envelope padrão do
+    # Chatterbox Multilingual e, nos logs CTEC, o modelo colapsava em repetição
+    # de token. A fidelidade continua sendo preservada pelo áudio de referência;
+    # não esmagamos mais os parâmetros de geração.
     if base.get("voice_clone_fidelity_mode"):
-        base["stability"] = max(float(base.get("stability", 0.72)), 0.90)
-        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.94)
-        base["temperature"] = min(float(base.get("temperature", 0.78)), 0.56)
-        base["exaggeration"] = min(float(base.get("exaggeration", 0.48)), 0.40)
-        base["cfg_weight"] = max(float(base.get("cfg_weight", 0.50)), 0.62)
+        base["stability"] = max(float(base.get("stability", 0.72)), 0.80)
+        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.88)
 
-    # Consistência continua ativa para manter o mesmo perfil em todos os chunks.
     elif base.get("voice_consistency_mode"):
-        base["stability"] = max(float(base.get("stability", 0.72)), 0.90)
-        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.93)
-        base["temperature"] = min(float(base.get("temperature", 0.78)), 0.58)
-        base["exaggeration"] = min(float(base.get("exaggeration", 0.48)), 0.42)
-        base["cfg_weight"] = max(float(base.get("cfg_weight", 0.50)), 0.60)
+        base["stability"] = max(float(base.get("stability", 0.72)), 0.78)
+        base["voice_fidelity"] = max(float(base.get("voice_fidelity", 0.78)), 0.86)
+
+    # Envelope seguro do Chatterbox Multilingual. O perfil law_natural já usa
+    # os defaults próximos aos recomendados pelo projeto (temp~0.8, cfg~0.5).
+    # Impedimos apenas extremos capazes de tornar o sampling rígido demais.
+    if profile_name in {"law_natural", "law_formal"}:
+        base["temperature"] = clamp(float(base.get("temperature", 0.78)), 0.70, 1.00)
+        base["cfg_weight"] = clamp(float(base.get("cfg_weight", 0.50)), 0.30, 0.58)
+        base["exaggeration"] = clamp(float(base.get("exaggeration", 0.48)), 0.30, 0.60)
+        base["repetition_penalty"] = clamp(float(base.get("repetition_penalty", 1.20)), 1.15, 1.30)
 
     return base
 
@@ -2947,11 +2958,13 @@ def _retry_sampling_parameters(
         repetition_delta = 0.0
         min_p_delta = 0.0
     elif previous_failure_reason == "early_eos_token_repetition":
-        # Libera discretamente a amostragem sem descaracterizar a voz.
-        temperature_delta = 0.06 if attempt_index == 2 else 0.08
-        cfg_delta = -0.06 if attempt_index == 2 else -0.10
-        repetition_delta = 0.08 if attempt_index == 2 else 0.10
-        min_p_delta = 0.01
+        # Saída de colapso do T3: aumenta moderadamente a entropia e reduz CFG.
+        # Não muda timbre/referência; muda apenas o sampling da tentativa que
+        # já falhou por repetição explícita de token.
+        temperature_delta = 0.08 if attempt_index == 2 else 0.14
+        cfg_delta = -0.10 if attempt_index == 2 else -0.18
+        repetition_delta = 0.04 if attempt_index == 2 else 0.08
+        min_p_delta = 0.01 if attempt_index == 2 else 0.02
     else:
         # Este hotfix não muda a calibração para falhas comuns de ASR/TTS.
         temperature_delta = 0.0
@@ -2963,14 +2976,14 @@ def _retry_sampling_parameters(
         "temperature": float(clamp(
             temperature + temperature_delta,
             0.10,
-            0.68,
+            1.10,
         )),
         "exaggeration": float(clamp(exaggeration, 0.0, 1.0)),
-        "cfg_weight": float(clamp(cfg_weight + cfg_delta, 0.42, 1.0)),
+        "cfg_weight": float(clamp(cfg_weight + cfg_delta, 0.20, 1.0)),
         "repetition_penalty": float(clamp(
             repetition_penalty + repetition_delta,
             1.0,
-            1.36,
+            1.40,
         )),
         "min_p": float(clamp(min_p + min_p_delta, 0.01, 0.10)),
         "top_p": float(clamp(top_p, 0.80, 1.0)),
@@ -3067,34 +3080,14 @@ def generate_chunk_with_retry(
     stability = float(settings.get("stability", 0.90))
     fidelity = float(settings.get("voice_fidelity", 0.93))
 
-    if fidelity_mode:
-        # Mantém o timbre da referência sem sufocar a variação natural. Os
-        # limites anteriores (0.46/0.30/0.70) deixavam a fala excessivamente
-        # rígida e contribuíam para o efeito robótico.
-        effective_temperature = min(float(settings["temperature"]), 0.56)
-        effective_exaggeration = min(float(settings["exaggeration"]), 0.40)
-        effective_cfg = max(float(settings["cfg_weight"]), 0.62)
-    elif consistency_mode:
-        # Mesmos parâmetros em todas as tentativas/chunks.
-        effective_temperature = min(float(settings["temperature"]), 0.58)
-        effective_exaggeration = min(float(settings["exaggeration"]), 0.42)
-        effective_cfg = max(float(settings["cfg_weight"]), 0.60)
-    else:
-        effective_temperature = clamp(
-            float(settings["temperature"]) * (1.18 - stability * 0.34),
-            0.10,
-            1.50,
-        )
-        effective_exaggeration = clamp(
-            float(settings["exaggeration"]) * (1.10 - stability * 0.18),
-            0.0,
-            1.0,
-        )
-        effective_cfg = clamp(
-            float(settings["cfg_weight"]) + (fidelity - 0.5) * 0.12,
-            0.0,
-            1.0,
-        )
+    # Sampling deve refletir uma única configuração efetiva. O worker antigo
+    # aplicava novos clamps aqui, depois de resolve_settings(), criando duas
+    # camadas de calibração e forçando exatamente o padrão visto nos logs
+    # (temperature~0.55 + cfg~0.64). Agora esta função usa o envelope já
+    # resolvido uma única vez.
+    effective_temperature = float(settings["temperature"])
+    effective_exaggeration = float(settings["exaggeration"])
+    effective_cfg = float(settings["cfg_weight"])
 
     last_error: Exception | None = None
     last_transcript = ""
