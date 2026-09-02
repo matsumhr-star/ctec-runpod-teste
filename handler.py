@@ -1137,8 +1137,27 @@ def _select_reference_segment(
             "A amostra precisa ter pelo menos 3 segundos; prefira de 15 a 30 segundos de fala limpa."
         )
 
+    # Garante uma configuração coerente sem desfazer o conditioning curto do
+    # voice_clone_fidelity_mode (10 s de alvo / 12 s de máximo).
+    max_seconds = max(3.0, float(max_seconds))
+    target_seconds = float(clamp(float(target_seconds), 3.0, max_seconds))
+    minimum_segment_seconds = min(
+        max_seconds,
+        max(3.0, target_seconds * 0.90),
+    )
+
     # Referências já curtas não precisam ser recortadas.
     if total_seconds <= max_seconds:
+        print(
+            "[CTEC] reference_target_seconds="
+            f"{target_seconds:.2f} | reference_max_seconds={max_seconds:.2f} | "
+            "reference_minimum_segment_seconds="
+            f"{minimum_segment_seconds:.2f} | reference_windows_total=1 | "
+            "reference_windows_scored=0 | reference_windows_rejected_duration=0 | "
+            "best_reference_score=not_scored_short_reference | "
+            "best_reference_start_sec=0.00",
+            flush=True,
+        )
         return decoded, {
             "reference_original_duration_sec": round(total_seconds, 2),
             "reference_selected_duration_sec": round(total_seconds, 2),
@@ -1146,8 +1165,8 @@ def _select_reference_segment(
             "reference_was_trimmed": False,
         }
 
-    target_seconds = float(clamp(target_seconds, 15.0, max_seconds))
     target_samples = max(1, int(target_seconds * sample_rate))
+    minimum_segment_samples = max(1, int(minimum_segment_seconds * sample_rate))
     edge_guard_seconds = 5.0
     first_start = int(min(edge_guard_seconds, max(0.0, total_seconds * 0.05)) * sample_rate)
     last_start = max(first_start, mono.numel() - target_samples - int(edge_guard_seconds * sample_rate))
@@ -1161,18 +1180,48 @@ def _select_reference_segment(
 
     best_start = None
     best_score = -1e9
+    windows_scored = 0
+    windows_rejected_duration = 0
+
     for start in starts:
         end = min(mono.numel(), start + target_samples)
         segment = mono[start:end]
-        if segment.numel() < int(sample_rate * 15.0):
+        if segment.numel() < minimum_segment_samples:
+            windows_rejected_duration += 1
             continue
         score = _reference_window_score(segment, sample_rate)
+        windows_scored += 1
         if score > best_score:
             best_score = score
             best_start = start
 
+    best_score_log = f"{best_score:.2f}" if best_start is not None else "none"
+    best_start_log = (
+        f"{(best_start / sample_rate):.2f}" if best_start is not None else "none"
+    )
+    print(
+        "[CTEC] reference_target_seconds="
+        f"{target_seconds:.2f} | reference_max_seconds={max_seconds:.2f} | "
+        "reference_minimum_segment_seconds="
+        f"{minimum_segment_seconds:.2f} | reference_windows_total={len(starts)} | "
+        f"reference_windows_scored={windows_scored} | "
+        f"reference_windows_rejected_duration={windows_rejected_duration} | "
+        f"best_reference_score={best_score_log} | "
+        f"best_reference_start_sec={best_start_log}",
+        flush=True,
+    )
+
     if best_start is None:
-        raise ValueError("Não foi encontrada fala utilizável no áudio de referência.")
+        if windows_scored == 0:
+            raise ValueError(
+                "Nenhuma janela da referência atingiu a duração mínima necessária "
+                f"para análise ({minimum_segment_seconds:.2f} s). "
+                f"Janelas avaliadas: {len(starts)}; rejeitadas por duração: "
+                f"{windows_rejected_duration}."
+            )
+        raise ValueError(
+            "Nenhuma janela de referência pôde ser selecionada após a análise acústica."
+        )
 
     selected = root / "reference_selected.wav"
     end = min(mono.numel(), best_start + target_samples)
@@ -1181,7 +1230,9 @@ def _select_reference_segment(
 
     selected_seconds = float(selected_waveform.shape[1] / sample_rate)
     if selected_seconds < 3.0:
-        raise ValueError("Não foi encontrada fala utilizável no áudio de referência.")
+        raise ValueError(
+            "A janela selecionada da referência ficou abaixo de 3 segundos após o recorte."
+        )
 
     return selected, {
         "reference_original_duration_sec": round(total_seconds, 2),
