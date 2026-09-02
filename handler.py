@@ -904,7 +904,39 @@ def _split_oversized_legal_unit(value: str, limit: int) -> list[str]:
                 else:
                     boundary = span_end
             else:
+                # Nunca corta uma palavra no meio apenas para obedecer ao limite
+                # de caracteres. O limite é um alvo de segurança para o TTS, não
+                # autorização para alterar o texto jurídico.
                 boundary = upper
+                cuts_word = (
+                    boundary > start
+                    and boundary < len(source)
+                    and source[boundary - 1].isalnum()
+                    and source[boundary].isalnum()
+                )
+                if cuts_word:
+                    # Primeiro tenta recuar para a última fronteira segura dentro
+                    # do limite, desde que ela não produza um fragmento minúsculo.
+                    backward = [
+                        start + match.start()
+                        for match in re.finditer(r"\s+", source[start:upper + 1])
+                        if start + match.start() - start >= minimum
+                        and not _boundary_cuts_protected_reference(
+                            start + match.start(),
+                            spans,
+                        )
+                    ]
+                    if backward:
+                        boundary = max(backward)
+                    else:
+                        # Se não houver fronteira segura antes do limite, avança
+                        # até o fim da palavra atual. É preferível exceder poucos
+                        # caracteres a mutilar um token como FUNDAMENTAIS.
+                        forward_match = re.search(r"\s+", source[upper:])
+                        if forward_match:
+                            boundary = upper + forward_match.start()
+                        else:
+                            boundary = len(source)
 
         piece = source[start:boundary].strip()
         if not piece or boundary <= start:
