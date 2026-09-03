@@ -1013,6 +1013,171 @@ def split_legal_semantic_chunk(value: str, limit: int) -> list[str]:
     return [item for item in chunks if is_valid_generation_chunk(item)]
 
 
+def _fallback_minimum_viable_chars(value: str) -> int:
+    """Piso acústico dinâmico: evita subchunks curtos demais para prosódia estável."""
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not source:
+        return 18
+    # Para trechos curtos, mantém duas metades úteis; para longos, limita o piso.
+    return int(clamp(round(len(source) * 0.28), 18, 34))
+
+
+def _legal_heading_prefix_end(value: str) -> int:
+    """Fim do marcador inicial de TÍTULO/CAPÍTULO/... para não isolá-lo no fallback."""
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not source:
+        return 0
+    heading_pattern = rf"^(?:Título|Capítulo|Seção|Subseção|Livro|Parte)\s+{_LEGAL_NUMBER_EXPRESSION}\.?"
+    match = re.match(heading_pattern, source, flags=re.IGNORECASE)
+    return match.end() if match else 0
+
+
+def _balanced_fallback_word_split(
+    value: str,
+    *,
+    minimum_chars: int,
+) -> list[str]:
+    """
+    Divide um trecho curto/teimoso em duas partes equilibradas, somente em espaço.
+
+    Regras:
+    - nunca corta palavra ou referência jurídica protegida;
+    - não deixa cabeçalho jurídico sozinho;
+    - exige contexto mínimo dos dois lados;
+    - escolhe a fronteira mais próxima do meio do texto.
+    """
+    source = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not source:
+        return []
+
+    spans = _protected_legal_reference_spans(source)
+    heading_end = _legal_heading_prefix_end(source)
+    midpoint = len(source) / 2.0
+    candidates: list[tuple[float, int]] = []
+
+    for match in re.finditer(r"\s+", source):
+        boundary = match.start()
+        if boundary <= 0 or boundary >= len(source):
+            continue
+        if _boundary_cuts_protected_reference(boundary, spans):
+            continue
+
+        left = source[:boundary].strip()
+        right = source[match.end():].strip()
+        if len(left) < minimum_chars or len(right) < minimum_chars:
+            continue
+        if len(left.split()) < 3 or len(right.split()) < 3:
+            continue
+
+        # Se houver TÍTULO/CAPÍTULO/etc. no início, o primeiro pedaço deve
+        # carregar conteúdo depois do marcador, em vez de gerar "TÍTULO um.".
+        if heading_end and boundary <= heading_end:
+            continue
+
+        balance_penalty = abs(len(left) - len(right))
+        midpoint_penalty = abs(boundary - midpoint)
+        score = midpoint_penalty + (balance_penalty * 0.35)
+        candidates.append((score, boundary))
+
+    if not candidates:
+        return []
+
+    _, boundary = min(candidates, key=lambda item: item[0])
+    # boundary aponta para o início do espaço; consome o espaço no lado direito.
+    right_start = boundary
+    while right_start < len(source) and source[right_start].isspace():
+        right_start += 1
+
+    left_raw = source[:boundary].strip()
+    right_raw = source[right_start:].strip()
+
+    # Quando a fronteira equilibrada cai no meio de uma oração, não inventa
+    # um ponto final: usa vírgula de continuação para evitar reinício brusco
+    # de prosódia entre os dois subchunks. Se já havia pontuação forte, preserva.
+    if left_raw and not re.search(r"[,;:.!?]$", left_raw):
+        left_part = left_raw + ","
+    else:
+        left_part = clean_generation_chunk(left_raw)
+
+    parts = [
+        left_part,
+        clean_generation_chunk(right_raw),
+    ]
+    parts = [part for part in parts if is_valid_generation_chunk(part)]
+    if len(parts) != 2:
+        return []
+
+    validate_chunk_integrity(source, [(part, False) for part in parts])
+    return parts
+
+
+def _rebalance_fallback_parts_for_acoustic_context(
+    source: str,
+    parts: list[str],
+) -> list[str]:
+    """
+    Evita microchunks no fallback sem perder nenhum token.
+
+    Primeiro tenta uma divisão binária equilibrada quando qualquer parte ficou
+    acusticamente pobre. Em trechos maiores/múltiplos, junta fragmentos minúsculos
+    ao vizinho mais natural, preferindo o seguinte para cabeçalhos jurídicos.
+    """
+    original = re.sub(r"\s+", " ", str(source or "")).strip()
+    cleaned = [
+        clean_generation_chunk(part)
+        for part in parts
+        if is_valid_generation_chunk(part)
+    ]
+    if len(cleaned) <= 1:
+        return cleaned
+
+    minimum = _fallback_minimum_viable_chars(original)
+    has_tiny = any(
+        len(part) < minimum or len(part.split()) < 3
+        for part in cleaned
+    )
+    if not has_tiny:
+        return cleaned
+
+    balanced = _balanced_fallback_word_split(
+        original,
+        minimum_chars=minimum,
+    )
+    if balanced:
+        print(
+            "[CTEC] Fallback reequilibrado para contexto acústico: "
+            f"original_chars={len(original)} | minimum_viable={minimum} | "
+            f"parts={[len(part) for part in balanced]}",
+            flush=True,
+        )
+        return balanced
+
+    # Fallback conservador para textos em que duas metades equilibradas não são
+    # possíveis (ex.: referências longas protegidas). Junta o fragmento curto ao
+    # vizinho sem alterar a ordem dos tokens.
+    rebalanced = list(cleaned)
+    index = 0
+    while index < len(rebalanced) and len(rebalanced) > 1:
+        part = rebalanced[index]
+        tiny = len(part) < minimum or len(part.split()) < 3
+        if not tiny:
+            index += 1
+            continue
+
+        kind = _leading_legal_structure(part)
+        if index == 0 or kind == "heading":
+            merged = f"{part} {rebalanced[index + 1]}".strip()
+            rebalanced[index:index + 2] = [clean_generation_chunk(merged)]
+        else:
+            merged = f"{rebalanced[index - 1]} {part}".strip()
+            rebalanced[index - 1:index + 1] = [clean_generation_chunk(merged)]
+            index = max(0, index - 1)
+
+    if len(rebalanced) > 1:
+        validate_chunk_integrity(original, [(part, False) for part in rebalanced])
+    return rebalanced
+
+
 def adapt_chunks_for_legal_complexity(
     chunks: list[tuple[str, bool]],
     maximum_chars: int,
@@ -2885,6 +3050,11 @@ def _split_incomplete_chunk_for_fallback(
         if is_valid_generation_chunk(part)
     ]
 
+    # Um fallback semanticamente válido ainda pode ser acusticamente ruim.
+    # Ex.: "TÍTULO um." isolado reinicia a prosódia e pode até aumentar a
+    # incidência de token_repetition. Reequilibra antes de aprofundar o fallback.
+    parts = _rebalance_fallback_parts_for_acoustic_context(source, parts)
+
     # Se a divisão semântica ainda não reduziu, força progresso com limite menor,
     # sempre respeitando os spans de referências jurídicas.
     if len(parts) <= 1 and len(source) > hard_floor:
@@ -2898,6 +3068,7 @@ def _split_incomplete_chunk_for_fallback(
             for part in forced
             if is_valid_generation_chunk(part)
         ]
+        parts = _rebalance_fallback_parts_for_acoustic_context(source, parts)
 
     if len(parts) <= 1:
         return []
