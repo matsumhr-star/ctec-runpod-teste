@@ -462,6 +462,87 @@ def punctuate_legal_speech_structure(text: str) -> str:
     return text
 
 
+def normalize_legal_heading_case_for_speech(text: str) -> str:
+    """Normaliza SOMENTE a capitalização da cópia narrada dos cabeçalhos jurídicos.
+
+    O texto jurídico original não é alterado. O objetivo é evitar enviar ao
+    Chatterbox sequências inteiras em CAIXA ALTA, que nos testes CTEC entraram em
+    early_eos_token_repetition mesmo com 24, 49 e 110 caracteres de contexto.
+    Palavras, ordem e pontuação são preservadas; apenas o casing muda.
+    """
+    heading_names = {
+        "título": "Título",
+        "titulo": "Título",
+        "capítulo": "Capítulo",
+        "capitulo": "Capítulo",
+        "seção": "Seção",
+        "secao": "Seção",
+        "subseção": "Subseção",
+        "subsecao": "Subseção",
+        "livro": "Livro",
+        "parte": "Parte",
+    }
+
+    changed = 0
+    normalized_lines: list[str] = []
+
+    for raw_line in str(text or "").splitlines():
+        leading = raw_line[: len(raw_line) - len(raw_line.lstrip())]
+        trailing = raw_line[len(raw_line.rstrip()):] if raw_line.rstrip() != raw_line else ""
+        core = raw_line.strip()
+        if not core:
+            normalized_lines.append(raw_line)
+            continue
+
+        letters = [char for char in core if char.isalpha()]
+        uppercase_letters = sum(1 for char in letters if char.isupper())
+        uppercase_ratio = uppercase_letters / max(1, len(letters))
+
+        # Cabeçalho estrutural: normaliza o nome jurídico mesmo quando o número
+        # já foi convertido para palavra minúscula, por exemplo "TÍTULO um.".
+        structural = re.match(
+            r"^(TÍTULO|TITULO|CAPÍTULO|CAPITULO|SEÇÃO|SECAO|SUBSEÇÃO|SUBSECAO|LIVRO|PARTE)\b(.*)$",
+            core,
+            flags=re.IGNORECASE,
+        )
+        if structural:
+            key = structural.group(1).lower()
+            rest = structural.group(2)
+            canonical = heading_names.get(key, structural.group(1).capitalize())
+            candidate = canonical + rest
+            if candidate != core:
+                core = candidate
+                changed += 1
+
+        # Linha/título editorial em caixa alta: converte para capitalização de
+        # fala natural. Não usa str.title(), para não transformar cada palavra
+        # em início de nome próprio e criar outra prosódia artificial.
+        letters = [char for char in core if char.isalpha()]
+        uppercase_letters = sum(1 for char in letters if char.isupper())
+        uppercase_ratio = uppercase_letters / max(1, len(letters))
+        if len(letters) >= 4 and uppercase_ratio >= 0.85:
+            lower = core.lower()
+            first_alpha = next((i for i, ch in enumerate(lower) if ch.isalpha()), None)
+            if first_alpha is not None:
+                candidate = (
+                    lower[:first_alpha]
+                    + lower[first_alpha].upper()
+                    + lower[first_alpha + 1:]
+                )
+                if candidate != core:
+                    core = candidate
+                    changed += 1
+
+        normalized_lines.append(leading + core + trailing)
+
+    if changed:
+        print(
+            f"[CTEC] Capitalização de fala dos cabeçalhos normalizada: alterações={changed}",
+            flush=True,
+        )
+    return "\n".join(normalized_lines)
+
+
 def normalize_law_text(
     text: str,
     custom_dictionary: list[dict[str, Any]] | None = None,
@@ -620,6 +701,10 @@ def normalize_law_text(
     text = re.sub(r"\s*[—–]\s*", " — ", text)
     text = re.sub(r" +([,.;:])", r"\1", text)
     text = punctuate_legal_speech_structure(text)
+    # A pontuação estrutural é criada primeiro; depois normalizamos apenas a
+    # capitalização da CÓPIA DE FALA para não alimentar o TTS com cabeçalhos
+    # inteiros em caixa alta. O texto legal original permanece intacto.
+    text = normalize_legal_heading_case_for_speech(text)
     return collapse_soft_line_breaks(text)
 
 
