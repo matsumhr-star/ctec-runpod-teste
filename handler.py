@@ -1178,6 +1178,109 @@ def _rebalance_fallback_parts_for_acoustic_context(
     return rebalanced
 
 
+def _attach_short_legal_headings_to_following_context(
+    parts: list[str],
+    limit: int,
+    *,
+    preferred_min_chars: int = 84,
+) -> list[str]:
+    """
+    Evita enviar cabeçalhos jurídicos curtos como chamadas TTS independentes.
+
+    Um TÍTULO/CAPÍTULO/SEÇÃO curto carrega o bloco seguinte sempre que couber.
+    Se o bloco seguinte inteiro não couber, toma apenas um prefixo seguro dele,
+    preservando a ordem dos tokens e sem cortar referência jurídica protegida.
+    """
+    items = [
+        re.sub(r"\s+", " ", str(part or "")).strip()
+        for part in parts
+        if is_valid_generation_chunk(part)
+    ]
+    if len(items) <= 1:
+        return items
+
+    limit = max(36, int(limit))
+    preferred_min_chars = int(clamp(preferred_min_chars, 56, max(56, limit - 18)))
+    output: list[str] = []
+    index = 0
+
+    while index < len(items):
+        current = items[index]
+        is_short_heading = (
+            _leading_legal_structure(current) == "heading"
+            and len(current) < preferred_min_chars
+            and index + 1 < len(items)
+        )
+        if not is_short_heading:
+            output.append(current)
+            index += 1
+            continue
+
+        following = items[index + 1]
+        combined = f"{current} {following}".strip()
+        if len(combined) <= limit:
+            output.append(combined)
+            print(
+                "[CTEC] Cabeçalho jurídico acoplado ao contexto seguinte: "
+                f"heading_chars={len(current)} | combined_chars={len(combined)} | "
+                f"limit={limit}",
+                flush=True,
+            )
+            index += 2
+            continue
+
+        # Se o próximo bloco inteiro ultrapassar o limite, empresta apenas um
+        # prefixo lexical útil. A fronteira nunca atravessa referência protegida.
+        max_prefix = limit - len(current) - 1
+        needed_prefix = max(18, preferred_min_chars - len(current))
+        spans = _protected_legal_reference_spans(following)
+        boundaries = []
+        for match in re.finditer(r"\s+", following):
+            boundary = match.start()
+            if boundary < needed_prefix or boundary > max_prefix:
+                continue
+            if _boundary_cuts_protected_reference(boundary, spans):
+                continue
+            boundaries.append(boundary)
+
+        if boundaries:
+            # Prefere contexto suficiente sem inflar desnecessariamente o chunk.
+            target = min(max_prefix, max(needed_prefix, int(max_prefix * 0.72)))
+            boundary = min(boundaries, key=lambda point: abs(point - target))
+            prefix = following[:boundary].strip()
+            remainder = following[boundary:].strip()
+
+            attached = f"{current} {prefix}".strip()
+            if attached and not re.search(r"[,;:.!?]$", attached):
+                attached += ","
+
+            output.append(attached)
+            if remainder:
+                items[index + 1] = remainder
+            else:
+                index += 1
+
+            print(
+                "[CTEC] Cabeçalho jurídico recebeu contexto parcial: "
+                f"heading_chars={len(current)} | attached_chars={len(attached)} | "
+                f"remaining_chars={len(remainder)} | limit={limit}",
+                flush=True,
+            )
+            index += 1
+            continue
+
+        # Sem fronteira segura, preserva o texto original; nunca corta palavra
+        # nem referência só para satisfazer o limite.
+        output.append(current)
+        index += 1
+
+    validate_chunk_integrity(
+        " ".join(parts),
+        [(part, False) for part in output],
+    )
+    return output
+
+
 def adapt_chunks_for_legal_complexity(
     chunks: list[tuple[str, bool]],
     maximum_chars: int,
@@ -1201,6 +1304,14 @@ def adapt_chunks_for_legal_complexity(
         if len(parts) <= 1:
             output.append((chunk, paragraph_end))
             continue
+
+        # Cabeçalhos curtos não devem virar chamadas TTS independentes.
+        # Acopla TÍTULO/CAPÍTULO/SEÇÃO ao contexto imediatamente seguinte
+        # antes da geração, mantendo o fallback recursivo como segunda defesa.
+        parts = _attach_short_legal_headings_to_following_context(
+            parts,
+            adaptive_limit,
+        )
         validate_chunk_integrity(chunk, [(part, False) for part in parts])
         for index, part in enumerate(parts):
             output.append((
