@@ -462,87 +462,6 @@ def punctuate_legal_speech_structure(text: str) -> str:
     return text
 
 
-def normalize_legal_heading_case_for_speech(text: str) -> str:
-    """Normaliza SOMENTE a capitalização da cópia narrada dos cabeçalhos jurídicos.
-
-    O texto jurídico original não é alterado. O objetivo é evitar enviar ao
-    Chatterbox sequências inteiras em CAIXA ALTA, que nos testes CTEC entraram em
-    early_eos_token_repetition mesmo com 24, 49 e 110 caracteres de contexto.
-    Palavras, ordem e pontuação são preservadas; apenas o casing muda.
-    """
-    heading_names = {
-        "título": "Título",
-        "titulo": "Título",
-        "capítulo": "Capítulo",
-        "capitulo": "Capítulo",
-        "seção": "Seção",
-        "secao": "Seção",
-        "subseção": "Subseção",
-        "subsecao": "Subseção",
-        "livro": "Livro",
-        "parte": "Parte",
-    }
-
-    changed = 0
-    normalized_lines: list[str] = []
-
-    for raw_line in str(text or "").splitlines():
-        leading = raw_line[: len(raw_line) - len(raw_line.lstrip())]
-        trailing = raw_line[len(raw_line.rstrip()):] if raw_line.rstrip() != raw_line else ""
-        core = raw_line.strip()
-        if not core:
-            normalized_lines.append(raw_line)
-            continue
-
-        letters = [char for char in core if char.isalpha()]
-        uppercase_letters = sum(1 for char in letters if char.isupper())
-        uppercase_ratio = uppercase_letters / max(1, len(letters))
-
-        # Cabeçalho estrutural: normaliza o nome jurídico mesmo quando o número
-        # já foi convertido para palavra minúscula, por exemplo "TÍTULO um.".
-        structural = re.match(
-            r"^(TÍTULO|TITULO|CAPÍTULO|CAPITULO|SEÇÃO|SECAO|SUBSEÇÃO|SUBSECAO|LIVRO|PARTE)\b(.*)$",
-            core,
-            flags=re.IGNORECASE,
-        )
-        if structural:
-            key = structural.group(1).lower()
-            rest = structural.group(2)
-            canonical = heading_names.get(key, structural.group(1).capitalize())
-            candidate = canonical + rest
-            if candidate != core:
-                core = candidate
-                changed += 1
-
-        # Linha/título editorial em caixa alta: converte para capitalização de
-        # fala natural. Não usa str.title(), para não transformar cada palavra
-        # em início de nome próprio e criar outra prosódia artificial.
-        letters = [char for char in core if char.isalpha()]
-        uppercase_letters = sum(1 for char in letters if char.isupper())
-        uppercase_ratio = uppercase_letters / max(1, len(letters))
-        if len(letters) >= 4 and uppercase_ratio >= 0.85:
-            lower = core.lower()
-            first_alpha = next((i for i, ch in enumerate(lower) if ch.isalpha()), None)
-            if first_alpha is not None:
-                candidate = (
-                    lower[:first_alpha]
-                    + lower[first_alpha].upper()
-                    + lower[first_alpha + 1:]
-                )
-                if candidate != core:
-                    core = candidate
-                    changed += 1
-
-        normalized_lines.append(leading + core + trailing)
-
-    if changed:
-        print(
-            f"[CTEC] Capitalização de fala dos cabeçalhos normalizada: alterações={changed}",
-            flush=True,
-        )
-    return "\n".join(normalized_lines)
-
-
 def normalize_law_text(
     text: str,
     custom_dictionary: list[dict[str, Any]] | None = None,
@@ -701,10 +620,6 @@ def normalize_law_text(
     text = re.sub(r"\s*[—–]\s*", " — ", text)
     text = re.sub(r" +([,.;:])", r"\1", text)
     text = punctuate_legal_speech_structure(text)
-    # A pontuação estrutural é criada primeiro; depois normalizamos apenas a
-    # capitalização da CÓPIA DE FALA para não alimentar o TTS com cabeçalhos
-    # inteiros em caixa alta. O texto legal original permanece intacto.
-    text = normalize_legal_heading_case_for_speech(text)
     return collapse_soft_line_breaks(text)
 
 
@@ -1098,274 +1013,6 @@ def split_legal_semantic_chunk(value: str, limit: int) -> list[str]:
     return [item for item in chunks if is_valid_generation_chunk(item)]
 
 
-def _fallback_minimum_viable_chars(value: str) -> int:
-    """Piso acústico dinâmico: evita subchunks curtos demais para prosódia estável."""
-    source = re.sub(r"\s+", " ", str(value or "")).strip()
-    if not source:
-        return 18
-    # Para trechos curtos, mantém duas metades úteis; para longos, limita o piso.
-    return int(clamp(round(len(source) * 0.28), 18, 34))
-
-
-def _legal_heading_prefix_end(value: str) -> int:
-    """Fim do marcador inicial de TÍTULO/CAPÍTULO/... para não isolá-lo no fallback."""
-    source = re.sub(r"\s+", " ", str(value or "")).strip()
-    if not source:
-        return 0
-    heading_pattern = rf"^(?:Título|Capítulo|Seção|Subseção|Livro|Parte)\s+{_LEGAL_NUMBER_EXPRESSION}\.?"
-    match = re.match(heading_pattern, source, flags=re.IGNORECASE)
-    return match.end() if match else 0
-
-
-def _balanced_fallback_word_split(
-    value: str,
-    *,
-    minimum_chars: int,
-) -> list[str]:
-    """
-    Divide um trecho curto/teimoso em duas partes equilibradas, somente em espaço.
-
-    Regras:
-    - nunca corta palavra ou referência jurídica protegida;
-    - não deixa cabeçalho jurídico sozinho;
-    - exige contexto mínimo dos dois lados;
-    - escolhe a fronteira mais próxima do meio do texto.
-    """
-    source = re.sub(r"\s+", " ", str(value or "")).strip()
-    if not source:
-        return []
-
-    spans = _protected_legal_reference_spans(source)
-    heading_end = _legal_heading_prefix_end(source)
-    midpoint = len(source) / 2.0
-    candidates: list[tuple[float, int]] = []
-
-    for match in re.finditer(r"\s+", source):
-        boundary = match.start()
-        if boundary <= 0 or boundary >= len(source):
-            continue
-        if _boundary_cuts_protected_reference(boundary, spans):
-            continue
-
-        left = source[:boundary].strip()
-        right = source[match.end():].strip()
-        if len(left) < minimum_chars or len(right) < minimum_chars:
-            continue
-        if len(left.split()) < 3 or len(right.split()) < 3:
-            continue
-
-        # Se houver TÍTULO/CAPÍTULO/etc. no início, o primeiro pedaço deve
-        # carregar conteúdo depois do marcador, em vez de gerar "TÍTULO um.".
-        if heading_end and boundary <= heading_end:
-            continue
-
-        balance_penalty = abs(len(left) - len(right))
-        midpoint_penalty = abs(boundary - midpoint)
-        score = midpoint_penalty + (balance_penalty * 0.35)
-        candidates.append((score, boundary))
-
-    if not candidates:
-        return []
-
-    _, boundary = min(candidates, key=lambda item: item[0])
-    # boundary aponta para o início do espaço; consome o espaço no lado direito.
-    right_start = boundary
-    while right_start < len(source) and source[right_start].isspace():
-        right_start += 1
-
-    left_raw = source[:boundary].strip()
-    right_raw = source[right_start:].strip()
-
-    # Quando a fronteira equilibrada cai no meio de uma oração, não inventa
-    # um ponto final: usa vírgula de continuação para evitar reinício brusco
-    # de prosódia entre os dois subchunks. Se já havia pontuação forte, preserva.
-    if left_raw and not re.search(r"[,;:.!?]$", left_raw):
-        left_part = left_raw + ","
-    else:
-        left_part = clean_generation_chunk(left_raw)
-
-    parts = [
-        left_part,
-        clean_generation_chunk(right_raw),
-    ]
-    parts = [part for part in parts if is_valid_generation_chunk(part)]
-    if len(parts) != 2:
-        return []
-
-    validate_chunk_integrity(source, [(part, False) for part in parts])
-    return parts
-
-
-def _rebalance_fallback_parts_for_acoustic_context(
-    source: str,
-    parts: list[str],
-) -> list[str]:
-    """
-    Evita microchunks no fallback sem perder nenhum token.
-
-    Primeiro tenta uma divisão binária equilibrada quando qualquer parte ficou
-    acusticamente pobre. Em trechos maiores/múltiplos, junta fragmentos minúsculos
-    ao vizinho mais natural, preferindo o seguinte para cabeçalhos jurídicos.
-    """
-    original = re.sub(r"\s+", " ", str(source or "")).strip()
-    cleaned = [
-        clean_generation_chunk(part)
-        for part in parts
-        if is_valid_generation_chunk(part)
-    ]
-    if len(cleaned) <= 1:
-        return cleaned
-
-    minimum = _fallback_minimum_viable_chars(original)
-    has_tiny = any(
-        len(part) < minimum or len(part.split()) < 3
-        for part in cleaned
-    )
-    if not has_tiny:
-        return cleaned
-
-    balanced = _balanced_fallback_word_split(
-        original,
-        minimum_chars=minimum,
-    )
-    if balanced:
-        print(
-            "[CTEC] Fallback reequilibrado para contexto acústico: "
-            f"original_chars={len(original)} | minimum_viable={minimum} | "
-            f"parts={[len(part) for part in balanced]}",
-            flush=True,
-        )
-        return balanced
-
-    # Fallback conservador para textos em que duas metades equilibradas não são
-    # possíveis (ex.: referências longas protegidas). Junta o fragmento curto ao
-    # vizinho sem alterar a ordem dos tokens.
-    rebalanced = list(cleaned)
-    index = 0
-    while index < len(rebalanced) and len(rebalanced) > 1:
-        part = rebalanced[index]
-        tiny = len(part) < minimum or len(part.split()) < 3
-        if not tiny:
-            index += 1
-            continue
-
-        kind = _leading_legal_structure(part)
-        if index == 0 or kind == "heading":
-            merged = f"{part} {rebalanced[index + 1]}".strip()
-            rebalanced[index:index + 2] = [clean_generation_chunk(merged)]
-        else:
-            merged = f"{rebalanced[index - 1]} {part}".strip()
-            rebalanced[index - 1:index + 1] = [clean_generation_chunk(merged)]
-            index = max(0, index - 1)
-
-    if len(rebalanced) > 1:
-        validate_chunk_integrity(original, [(part, False) for part in rebalanced])
-    return rebalanced
-
-
-def _attach_short_legal_headings_to_following_context(
-    parts: list[str],
-    limit: int,
-    *,
-    preferred_min_chars: int = 84,
-) -> list[str]:
-    """
-    Evita enviar cabeçalhos jurídicos curtos como chamadas TTS independentes.
-
-    Um TÍTULO/CAPÍTULO/SEÇÃO curto carrega o bloco seguinte sempre que couber.
-    Se o bloco seguinte inteiro não couber, toma apenas um prefixo seguro dele,
-    preservando a ordem dos tokens e sem cortar referência jurídica protegida.
-    """
-    items = [
-        re.sub(r"\s+", " ", str(part or "")).strip()
-        for part in parts
-        if is_valid_generation_chunk(part)
-    ]
-    if len(items) <= 1:
-        return items
-
-    limit = max(36, int(limit))
-    preferred_min_chars = int(clamp(preferred_min_chars, 56, max(56, limit - 18)))
-    output: list[str] = []
-    index = 0
-
-    while index < len(items):
-        current = items[index]
-        is_short_heading = (
-            _leading_legal_structure(current) == "heading"
-            and len(current) < preferred_min_chars
-            and index + 1 < len(items)
-        )
-        if not is_short_heading:
-            output.append(current)
-            index += 1
-            continue
-
-        following = items[index + 1]
-        combined = f"{current} {following}".strip()
-        if len(combined) <= limit:
-            output.append(combined)
-            print(
-                "[CTEC] Cabeçalho jurídico acoplado ao contexto seguinte: "
-                f"heading_chars={len(current)} | combined_chars={len(combined)} | "
-                f"limit={limit}",
-                flush=True,
-            )
-            index += 2
-            continue
-
-        # Se o próximo bloco inteiro ultrapassar o limite, empresta apenas um
-        # prefixo lexical útil. A fronteira nunca atravessa referência protegida.
-        max_prefix = limit - len(current) - 1
-        needed_prefix = max(18, preferred_min_chars - len(current))
-        spans = _protected_legal_reference_spans(following)
-        boundaries = []
-        for match in re.finditer(r"\s+", following):
-            boundary = match.start()
-            if boundary < needed_prefix or boundary > max_prefix:
-                continue
-            if _boundary_cuts_protected_reference(boundary, spans):
-                continue
-            boundaries.append(boundary)
-
-        if boundaries:
-            # Prefere contexto suficiente sem inflar desnecessariamente o chunk.
-            target = min(max_prefix, max(needed_prefix, int(max_prefix * 0.72)))
-            boundary = min(boundaries, key=lambda point: abs(point - target))
-            prefix = following[:boundary].strip()
-            remainder = following[boundary:].strip()
-
-            attached = f"{current} {prefix}".strip()
-            if attached and not re.search(r"[,;:.!?]$", attached):
-                attached += ","
-
-            output.append(attached)
-            if remainder:
-                items[index + 1] = remainder
-            else:
-                index += 1
-
-            print(
-                "[CTEC] Cabeçalho jurídico recebeu contexto parcial: "
-                f"heading_chars={len(current)} | attached_chars={len(attached)} | "
-                f"remaining_chars={len(remainder)} | limit={limit}",
-                flush=True,
-            )
-            index += 1
-            continue
-
-        # Sem fronteira segura, preserva o texto original; nunca corta palavra
-        # nem referência só para satisfazer o limite.
-        output.append(current)
-        index += 1
-
-    validate_chunk_integrity(
-        " ".join(parts),
-        [(part, False) for part in output],
-    )
-    return output
-
-
 def adapt_chunks_for_legal_complexity(
     chunks: list[tuple[str, bool]],
     maximum_chars: int,
@@ -1389,14 +1036,6 @@ def adapt_chunks_for_legal_complexity(
         if len(parts) <= 1:
             output.append((chunk, paragraph_end))
             continue
-
-        # Cabeçalhos curtos não devem virar chamadas TTS independentes.
-        # Acopla TÍTULO/CAPÍTULO/SEÇÃO ao contexto imediatamente seguinte
-        # antes da geração, mantendo o fallback recursivo como segunda defesa.
-        parts = _attach_short_legal_headings_to_following_context(
-            parts,
-            adaptive_limit,
-        )
         validate_chunk_integrity(chunk, [(part, False) for part in parts])
         for index, part in enumerate(parts):
             output.append((
@@ -1743,6 +1382,52 @@ def prepare_reference_audio(
 def resolve_settings(data: dict[str, Any]) -> dict[str, Any]:
     profile_name = str(data.get("profile") or "law_natural").strip().lower()
     base = dict(PROFILES.get(profile_name, PROFILES["law_natural"]))
+
+    # A calibração aprovada chega do Flutter em um objeto aninhado. Antes,
+    # resolve_settings() simplesmente ignorava esse objeto e a geração acabava
+    # usando somente o preset. Agora o handler é a autoridade: ele aplica a
+    # calibração somente quando ela foi realmente aprovada e depois passa todos
+    # os valores pelo envelope de segurança abaixo. Assim não existe mais a
+    # combinação "calibração diz uma coisa / handler usa outra".
+    calibration = data.get("calibration")
+    if isinstance(calibration, dict) and to_bool(
+        calibration.get("calibrationApproved"), False
+    ):
+        calibration_map = {
+            "stability": "stability",
+            "voiceFidelity": "voice_fidelity",
+            "temperature": "temperature",
+            "cfgWeight": "cfg_weight",
+            "commaPauseMs": "pause_comma_ms",
+            "periodPauseMs": "pause_sentence_ms",
+            "colonPauseMs": "pause_colon_ms",
+            "paragraphPauseMs": "pause_paragraph_ms",
+            "initialSilenceMs": "initial_silence_ms",
+            "finalSilenceMs": "final_silence_ms",
+            "maxChunkCharacters": "chunk_limit",
+            "chunkOverlapWords": "chunk_overlap_words",
+            "preserveCompleteSentences": "preserve_complete_sentences",
+            "splitByLegalStructure": "split_by_legal_structure",
+        }
+        for source_key, target_key in calibration_map.items():
+            if source_key in calibration:
+                base[target_key] = calibration[source_key]
+
+        print(
+            f"[CTEC] approved_calibration=true | profile={profile_name} | "
+            f"temperature={base.get('temperature')} | "
+            f"cfg={base.get('cfg_weight')} | "
+            f"stability={base.get('stability')} | "
+            f"voice_fidelity={base.get('voice_fidelity')}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[CTEC] approved_calibration=false | profile={profile_name} | "
+            "using_profile_defaults=true",
+            flush=True,
+        )
+
     base.setdefault("stability", 0.72)
     base.setdefault("voice_fidelity", 0.78)
     base.setdefault("pause_comma_ms", 250)
@@ -2558,9 +2243,30 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
     target_profile = str(data.get("target_profile") or "law_natural").strip()
     base = resolve_settings({"profile": target_profile})
 
+    # A calibração nunca mais testa combinações fora do envelope do perfil.
+    # Antes A/B usavam temperature 0.46/0.54 e CFG 0.68/0.60; isso podia
+    # provocar exatamente o comportamento de EOS precoce por repetição que
+    # apareceu nos logs. Os candidatos abaixo ficam dentro da faixa segura e
+    # variam apenas o suficiente para a calibração comparar naturalidade.
     candidates = [
-        {"id": "candidate_a", "name": "A", "exaggeration": 0.30, "cfg_weight": 0.68, "temperature": 0.46, "speed": 0.94, "stability": 0.86},
-        {"id": "candidate_b", "name": "B", "exaggeration": 0.40, "cfg_weight": 0.60, "temperature": 0.54, "speed": 0.97, "stability": 0.78},
+        {
+            "id": "candidate_a",
+            "name": "A",
+            "exaggeration": 0.36,
+            "cfg_weight": 0.50,
+            "temperature": 0.78,
+            "speed": 0.96,
+            "stability": 0.84,
+        },
+        {
+            "id": "candidate_b",
+            "name": "B",
+            "exaggeration": 0.44,
+            "cfg_weight": 0.44,
+            "temperature": 0.86,
+            "speed": 0.99,
+            "stability": 0.80,
+        },
     ]
 
     with _GENERATION_LOCK, tempfile.TemporaryDirectory(prefix="ctec_calibration_") as tmp:
@@ -2578,50 +2284,81 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
             runpod.serverless.progress_update(
                 job, f"Calibração automática: teste {index} de {len(candidates)}"
             )
-            settings = dict(base)
-            settings.update(candidate)
-            wav_path = root / f"candidate_{candidate['name']}.wav"
-            duration = write_generated_candidate(
-                model, preview_text, reference_path, settings, wav_path
+            try:
+                settings = dict(base)
+                settings.update(candidate)
+                # Reaplica as mesmas regras do handler depois do A/B. O candidato
+                # não pode escapar do envelope só porque foi criado pela própria
+                # rotina de calibração.
+                settings = resolve_settings({
+                    "profile": target_profile,
+                    **{
+                        "speed": settings.get("speed"),
+                        "exaggeration": settings.get("exaggeration"),
+                        "cfg_weight": settings.get("cfg_weight"),
+                        "temperature": settings.get("temperature"),
+                        "stability": settings.get("stability"),
+                        "repetition_penalty": settings.get("repetition_penalty"),
+                    },
+                })
+                wav_path = root / f"candidate_{candidate['name']}.wav"
+                duration = write_generated_candidate(
+                    model, preview_text, reference_path, settings, wav_path
+                )
+                transcript = transcribe_audio(wav_path)
+                similarity = transcription_similarity(preview_text, transcript)
+                expected_duration = max(2.0, len(preview_text.split()) / 2.7)
+                duration_ratio = duration / expected_duration
+                rhythm_score = 1.0 - min(1.0, abs(duration_ratio - 1.0) / 0.55)
+                completeness = similarity
+                score = (
+                    completeness * 72.0
+                    + rhythm_score * 18.0
+                    + (reference_metrics["qualityScore"] / 100.0) * 10.0
+                )
+                # Não deixa uma amostra com transcrição claramente incompleta
+                # ser escolhida apenas porque teve ritmo parecido.
+                if completeness < 0.80:
+                    score -= (0.80 - completeness) * 100.0
+                preview_mp3 = root / f"candidate_{candidate['name']}.mp3"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
+                        "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_mp3),
+                    ],
+                    check=True,
+                )
+                preview_b64 = base64.b64encode(preview_mp3.read_bytes()).decode("ascii")
+                results.append({
+                    "id": candidate["id"],
+                    "name": candidate["name"],
+                    "score": round(score, 1),
+                    "completeness": round(completeness * 100, 1),
+                    "rhythmStability": round(rhythm_score * 100, 1),
+                    "durationSeconds": round(duration, 2),
+                    "transcript": transcript,
+                    "expectedText": preview_text,
+                    "settings": public_settings(settings),
+                    "previewAudioBase64": preview_b64,
+                    "previewMimeType": "audio/mpeg",
+                })
+            except Exception as candidate_error:
+                print(
+                    f"[CTEC] calibração candidato {candidate['name']} falhou: "
+                    f"{candidate_error!r}; tentando o próximo candidato.",
+                    flush=True,
+                )
+
+        if not results:
+            raise RuntimeError(
+                "A calibração automática não conseguiu gerar nenhum candidato "
+                "dentro do envelope seguro do perfil."
             )
-            transcript = transcribe_audio(wav_path)
-            similarity = transcription_similarity(preview_text, transcript)
-            expected_duration = max(2.0, len(preview_text.split()) / 2.7)
-            duration_ratio = duration / expected_duration
-            rhythm_score = 1.0 - min(1.0, abs(duration_ratio - 1.0) / 0.55)
-            completeness = similarity
-            score = (
-                completeness * 72.0
-                + rhythm_score * 18.0
-                + (reference_metrics["qualityScore"] / 100.0) * 10.0
-            )
-            preview_mp3 = root / f"candidate_{candidate['name']}.mp3"
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
-                    "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_mp3),
-                ],
-                check=True,
-            )
-            preview_b64 = base64.b64encode(preview_mp3.read_bytes()).decode("ascii")
-            results.append({
-                "id": candidate["id"],
-                "name": candidate["name"],
-                "score": round(score, 1),
-                "completeness": round(completeness * 100, 1),
-                "rhythmStability": round(rhythm_score * 100, 1),
-                "durationSeconds": round(duration, 2),
-                "transcript": transcript,
-                "expectedText": preview_text,
-                "settings": public_settings(settings),
-                "previewAudioBase64": preview_b64,
-                "previewMimeType": "audio/mpeg",
-            })
 
         best = max(results, key=lambda item: item["score"])
         best_settings = dict(best["settings"])
         best_settings.update({
-            "stability": round(best["rhythmStability"] / 100.0, 3),
+            "stability": best["settings"].get("stability", 0.80),
             "voiceFidelity": round(clamp(
                 reference_metrics["qualityScore"] / 100.0, 0.55, 0.95
             ), 3),
@@ -2644,6 +2381,7 @@ def calibrate(job: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
             "referenceMetrics": reference_metrics,
             "bestCandidate": best["id"],
             "bestCandidateName": best["name"],
+            "calibrationPolicy": "safe_ab_v2",
             "candidates": results,
         }
 
@@ -3246,11 +2984,6 @@ def _split_incomplete_chunk_for_fallback(
         if is_valid_generation_chunk(part)
     ]
 
-    # Um fallback semanticamente válido ainda pode ser acusticamente ruim.
-    # Ex.: "TÍTULO um." isolado reinicia a prosódia e pode até aumentar a
-    # incidência de token_repetition. Reequilibra antes de aprofundar o fallback.
-    parts = _rebalance_fallback_parts_for_acoustic_context(source, parts)
-
     # Se a divisão semântica ainda não reduziu, força progresso com limite menor,
     # sempre respeitando os spans de referências jurídicas.
     if len(parts) <= 1 and len(source) > hard_floor:
@@ -3264,7 +2997,6 @@ def _split_incomplete_chunk_for_fallback(
             for part in forced
             if is_valid_generation_chunk(part)
         ]
-        parts = _rebalance_fallback_parts_for_acoustic_context(source, parts)
 
     if len(parts) <= 1:
         return []
