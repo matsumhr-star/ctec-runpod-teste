@@ -23,7 +23,7 @@ try:
 except Exception:
     WhisperModel = None
 
-BUILD = "CTEC-QWEN3-PTBR-ICL-V3-BOUNDARY-CLEAN-2026-09-25"
+BUILD = "CTEC-QWEN3-PTBR-ICL-V4-NO-PA-2026-09-25"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
@@ -144,11 +144,16 @@ def save_reference_audio(data: dict[str, Any], root: Path) -> Path:
     )
 
 def prepare_reference(source: Path, root: Path) -> Path:
-    # Qwen aceita referência curta. Mantemos até 12 s para compatibilidade com o CTEC.
+    # V4: mantém a referência inteira dentro do teto de 12 s, mas reserva
+    # 500 ms finais de silêncio real. No ICL isso impede que o contexto termine
+    # em um fonema da voz de referência, reduzindo o vazamento "pã" no início
+    # da geração seguinte sem alterar timbre, sotaque ou modo de clonagem.
     target = root / "reference.wav"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-i", str(source),
-        "-ac", "1", "-ar", "24000", "-t", "12", "-c:a", "pcm_s16le", str(target),
+        "-ac", "1", "-ar", "24000", "-t", "11.5",
+        "-af", "apad=pad_dur=0.5", "-t", "12",
+        "-c:a", "pcm_s16le", str(target),
     ]
     subprocess.run(cmd, check=True)
     if not target.exists() or target.stat().st_size < 1024:
@@ -320,11 +325,19 @@ def clean_icl_leading_artifact(
                 match_index = i
                 break
 
-        # Sem prefixo reconhecido: não mexe no áudio.
-        if match_index is None or match_index == 0:
+        # Se o ASR não localizou o começo do texto, não arriscamos cortar.
+        if match_index is None:
             return audio, 0.0
 
+        # V4: o "pã" pode ser curto demais para virar uma palavra no Whisper.
+        # Nesse caso a primeira palavra esperada aparece como words[0], porém
+        # começa alguns milissegundos depois do artefato. Antes o V3 devolvia o
+        # áudio intacto quando match_index == 0. Agora usamos o timestamp da
+        # própria primeira palavra como guarda: só removemos o que estiver antes
+        # dela, preservando 60 ms de ataque.
         start_sec = max(0.0, words[match_index][1] - 0.060)
+        if match_index == 0 and start_sec < 0.080:
+            return audio, 0.0
         cut_samples = int(round(start_sec * sample_rate))
         if cut_samples <= 0 or cut_samples >= audio.shape[-1]:
             return audio, 0.0
@@ -492,7 +505,7 @@ def capabilities() -> dict[str, Any]:
         "voice_clone": True,
         "reference_max_seconds": 12,
         "voice_clone_mode": "icl_full_ref_audio_plus_ref_text",
-        "boundary_cleanup": "asr_expected_text_guard_v1",
+        "boundary_cleanup": "asr_expected_text_guard_v2_plus_ref_tail_silence",
         "reference_transcription": "faster_whisper_pt",
         "target_locale": "pt-BR",
         "languages": list(LANGUAGES.keys()),
