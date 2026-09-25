@@ -18,7 +18,12 @@ import torch
 from num2words import num2words
 from qwen_tts import Qwen3TTSModel
 
-BUILD = "CTEC-QWEN3-V1-2026-09-25"
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
+
+BUILD = "CTEC-QWEN3-PTBR-ICL-V2-2026-09-25"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
@@ -30,6 +35,12 @@ WORKER_CONTRACT_VERSION = 3
 _MODEL = None
 _MODEL_LOCK = threading.Lock()
 _GENERATION_LOCK = threading.Lock()
+
+_WHISPER = None
+_WHISPER_LOCK = threading.Lock()
+_REFERENCE_TEXT_CACHE: dict[str, str] = {}
+_REFERENCE_TEXT_CACHE_LOCK = threading.Lock()
+WHISPER_MODEL_SIZE = os.getenv("CTEC_WHISPER_MODEL", "small")
 
 LANGUAGES = {
     "pt": "Portuguese", "en": "English", "es": "Spanish", "fr": "French",
@@ -252,6 +263,93 @@ def encode_output(path: Path) -> str:
         )
     return encoded.decode("ascii")
 
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+def get_whisper():
+    global _WHISPER
+    if WhisperModel is None:
+        raise RuntimeError(
+            "faster-whisper não está disponível. "
+            "Ele é necessário para transcrever a referência no modo ICL pt-BR."
+        )
+    if _WHISPER is None:
+        with _WHISPER_LOCK:
+            if _WHISPER is None:
+                compute_type = "float16" if DEVICE.startswith("cuda") else "int8"
+                whisper_device = "cuda" if DEVICE.startswith("cuda") else "cpu"
+                print(
+                    f"[CTEC-QWEN] carregando Whisper={WHISPER_MODEL_SIZE} "
+                    f"device={whisper_device} compute_type={compute_type}",
+                    flush=True,
+                )
+                _WHISPER = WhisperModel(
+                    WHISPER_MODEL_SIZE,
+                    device=whisper_device,
+                    compute_type=compute_type,
+                )
+    return _WHISPER
+
+def normalize_reference_transcript(text: str) -> str:
+    # Mantém o conteúdo reconhecido; apenas remove espaços quebrados.
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+def transcribe_reference_ptbr(reference: Path) -> tuple[str, str]:
+    """
+    Transcreve a MESMA referência curta enviada ao Qwen.
+    O texto reconhecido é usado como ref_text no ICL completo.
+    Cache por SHA-256 evita retranscrever a mesma voz em cada geração.
+    """
+    key = file_sha256(reference)
+
+    with _REFERENCE_TEXT_CACHE_LOCK:
+        cached = _REFERENCE_TEXT_CACHE.get(key)
+    if cached:
+        print(
+            f"[CTEC-QWEN] referência ICL: transcrição em cache "
+            f"hash={key[:12]} chars={len(cached)}",
+            flush=True,
+        )
+        return cached, key
+
+    model = get_whisper()
+    segments, info = model.transcribe(
+        str(reference),
+        language="pt",
+        beam_size=5,
+        best_of=5,
+        temperature=0.0,
+        vad_filter=False,
+        condition_on_previous_text=False,
+    )
+    transcript = normalize_reference_transcript(
+        " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+    )
+
+    if len(transcript) < 3:
+        raise RuntimeError(
+            "Não foi possível obter uma transcrição utilizável do áudio de referência "
+            "para a clonagem ICL."
+        )
+
+    with _REFERENCE_TEXT_CACHE_LOCK:
+        _REFERENCE_TEXT_CACHE[key] = transcript
+
+    detected = getattr(info, "language", None) or "pt"
+    probability = getattr(info, "language_probability", None)
+    print(
+        f"[CTEC-QWEN] referência ICL transcrita | hash={key[:12]} "
+        f"idioma={detected} prob={probability} chars={len(transcript)} "
+        f"texto={transcript!r}",
+        flush=True,
+    )
+    return transcript, key
+
 def capabilities() -> dict[str, Any]:
     return {
         "status": "ok",
@@ -262,6 +360,9 @@ def capabilities() -> dict[str, Any]:
         "device": DEVICE,
         "voice_clone": True,
         "reference_max_seconds": 12,
+        "voice_clone_mode": "icl_full_ref_audio_plus_ref_text",
+        "reference_transcription": "faster_whisper_pt",
+        "target_locale": "pt-BR",
         "languages": list(LANGUAGES.keys()),
         "chatterbox": False,
     }
@@ -295,12 +396,20 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         source = save_reference_audio(data, root)
         reference = prepare_reference(source, root)
 
-        # Primeira migração: x-vector-only evita exigir transcrição da referência
-        # e mantém compatibilidade com a biblioteca de vozes atual do CTEC.
+        # PT-BR V2:
+        # usa ICL completo (áudio + transcrição da própria referência).
+        # Isso fornece ao Qwen, além do timbre, o padrão fonético/prosódico
+        # presente na fala brasileira usada como referência.
+        reference_text, reference_hash = transcribe_reference_ptbr(reference)
         clone_prompt = model.create_voice_clone_prompt(
             ref_audio=str(reference),
-            ref_text=None,
-            x_vector_only_mode=True,
+            ref_text=reference_text,
+            x_vector_only_mode=False,
+        )
+        print(
+            f"[CTEC-QWEN] clone ICL completo | locale=pt-BR "
+            f"ref_hash={reference_hash[:12]} ref_chars={len(reference_text)}",
+            flush=True,
         )
 
         raw_wav = root / "raw.wav"
@@ -372,11 +481,16 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
             "chunks": len(chunks),
             "prepared_text": prepared_text,
             "reference_used": True,
-            "clone_mode": "x_vector_only",
+            "clone_mode": "icl_full",
+            "target_locale": "pt-BR",
+            "reference_transcript": reference_text,
+            "reference_hash": reference_hash,
             "settings": {
                 "profile": profile,
                 "speed": speed,
                 "language": language,
+                "locale": "pt-BR",
+                "reference_language": "pt",
                 "text_mode": text_mode,
                 "engine": "qwen3_tts",
             },
