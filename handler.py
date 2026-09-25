@@ -23,7 +23,7 @@ try:
 except Exception:
     WhisperModel = None
 
-BUILD = "CTEC-QWEN3-PTBR-ICL-V2-2026-09-25"
+BUILD = "CTEC-QWEN3-PTBR-ICL-V3-BOUNDARY-CLEAN-2026-09-25"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
@@ -237,6 +237,137 @@ def numpy_to_tensor(wav: np.ndarray) -> torch.Tensor:
         audio = audio / peak
     return torch.from_numpy(audio).float().unsqueeze(0)
 
+
+def _speech_token(value: str) -> str:
+    value = str(value or "").lower()
+    value = re.sub(r"[^\wÀ-ÿ]+", "", value, flags=re.UNICODE)
+    return value.strip("_")
+
+def clean_icl_leading_artifact(
+    audio: torch.Tensor,
+    sample_rate: int,
+    expected_text: str,
+    root: Path,
+    chunk_index: int,
+) -> tuple[torch.Tensor, float]:
+    """
+    Mitiga vazamento/artefato no início de blocos gerados em ICL.
+
+    Estratégia conservadora:
+    - transcreve apenas o áudio recém-gerado com timestamps por palavra;
+    - procura o começo real do texto solicitado;
+    - só corta quando há fala reconhecida ANTES desse começo;
+    - preserva 60 ms antes da primeira palavra esperada para não comer fonema;
+    - aplica fade-in curtíssimo para evitar clique de corte.
+    """
+    if audio.numel() == 0 or sample_rate <= 0:
+        return audio, 0.0
+
+    probe = root / f"boundary_probe_{chunk_index:04d}.wav"
+    pcm = audio[0].detach().cpu().numpy().astype(np.float32)
+    sf.write(str(probe), pcm, sample_rate)
+
+    expected_tokens = [
+        _speech_token(t)
+        for t in re.findall(r"\S+", expected_text)
+        if _speech_token(t)
+    ]
+    if not expected_tokens:
+        return audio, 0.0
+
+    try:
+        model = get_whisper()
+        segments, _ = model.transcribe(
+            str(probe),
+            language="pt",
+            beam_size=3,
+            best_of=3,
+            temperature=0.0,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            word_timestamps=True,
+        )
+
+        words = []
+        for segment in segments:
+            for word in (getattr(segment, "words", None) or []):
+                token = _speech_token(getattr(word, "word", ""))
+                if token:
+                    words.append(
+                        (
+                            token,
+                            float(getattr(word, "start", 0.0) or 0.0),
+                            float(getattr(word, "end", 0.0) or 0.0),
+                        )
+                    )
+
+        if not words:
+            return audio, 0.0
+
+        # Procura a primeira palavra do texto-alvo e confirma, quando possível,
+        # com a segunda palavra para não cortar por uma coincidência.
+        first = expected_tokens[0]
+        second = expected_tokens[1] if len(expected_tokens) > 1 else None
+        match_index = None
+
+        for i, (token, _, _) in enumerate(words):
+            if token != first:
+                continue
+            if second is None:
+                match_index = i
+                break
+            if i + 1 < len(words) and words[i + 1][0] == second:
+                match_index = i
+                break
+
+        # Sem prefixo reconhecido: não mexe no áudio.
+        if match_index is None or match_index == 0:
+            return audio, 0.0
+
+        start_sec = max(0.0, words[match_index][1] - 0.060)
+        cut_samples = int(round(start_sec * sample_rate))
+        if cut_samples <= 0 or cut_samples >= audio.shape[-1]:
+            return audio, 0.0
+
+        cleaned = audio[:, cut_samples:].clone()
+
+        # Fade-in de 8 ms somente na borda criada pelo corte.
+        fade_samples = min(
+            cleaned.shape[-1],
+            max(1, int(round(sample_rate * 0.008))),
+        )
+        if fade_samples > 1:
+            ramp = torch.linspace(
+                0.0,
+                1.0,
+                fade_samples,
+                dtype=cleaned.dtype,
+                device=cleaned.device,
+            )
+            cleaned[:, :fade_samples] *= ramp
+
+        prefix = " ".join(w[0] for w in words[:match_index])
+        print(
+            f"[CTEC-QWEN] boundary_clean bloco={chunk_index} "
+            f"corte_ms={start_sec * 1000:.0f} prefixo_removido={prefix!r}",
+            flush=True,
+        )
+        return cleaned, start_sec
+
+    except Exception as exc:
+        # Limpeza é proteção de qualidade; jamais derruba a geração principal.
+        print(
+            f"[CTEC-QWEN] boundary_clean bloco={chunk_index} "
+            f"ignorado_por={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return audio, 0.0
+    finally:
+        try:
+            probe.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def write_pcm16(writer: wave.Wave_write, audio: torch.Tensor) -> int:
     pcm = (audio[0].clamp(-1, 1) * 32767).round().to(torch.int16).cpu().numpy()
     writer.writeframesraw(pcm.tobytes())
@@ -361,6 +492,7 @@ def capabilities() -> dict[str, Any]:
         "voice_clone": True,
         "reference_max_seconds": 12,
         "voice_clone_mode": "icl_full_ref_audio_plus_ref_text",
+        "boundary_cleanup": "asr_expected_text_guard_v1",
         "reference_transcription": "faster_whisper_pt",
         "target_locale": "pt-BR",
         "languages": list(LANGUAGES.keys()),
@@ -438,6 +570,17 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 elif int(sr) != sample_rate:
                     raise RuntimeError("Qwen3-TTS alterou o sample rate entre blocos.")
                 tensor = numpy_to_tensor(wavs[0])
+
+                # Qwen ICL pode vazar um pequeno fragmento antes do texto-alvo
+                # em cada nova geração. Remove apenas prefixo confirmado por ASR.
+                tensor, boundary_trim_seconds = clean_icl_leading_artifact(
+                    tensor,
+                    sample_rate,
+                    chunk,
+                    root,
+                    index,
+                )
+
                 write_pcm16(writer, tensor)
                 silence(writer, sample_rate, 520 if paragraph_end else 260)
 
