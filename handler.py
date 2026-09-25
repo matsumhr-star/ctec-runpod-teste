@@ -1,3 +1,4 @@
+
 import base64
 import hashlib
 import json
@@ -6,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.request
 import wave
 from pathlib import Path
@@ -23,14 +25,14 @@ try:
 except Exception:
     WhisperModel = None
 
-BUILD = "CTEC-QWEN3-PTBR-ICL-V4-NO-PA-2026-09-25"
+BUILD = "CTEC-QWEN3-PTBR-ICL-V5-LONG-PROJECT-2026-09-25"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
 MAX_REFERENCE_BYTES = int(os.getenv("CTEC_MAX_REFERENCE_BYTES", str(30 * 1024 * 1024)))
 MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 * 1024 * 1024)))
 CHUNK_LIMIT = int(os.getenv("CTEC_QWEN_CHUNK_CHARS", "650"))
-WORKER_CONTRACT_VERSION = 3
+WORKER_CONTRACT_VERSION = 4
 
 _MODEL = None
 _MODEL_LOCK = threading.Lock()
@@ -408,6 +410,52 @@ def encode_output(path: Path) -> str:
     return encoded.decode("ascii")
 
 
+def upload_file_to_signed_url(path: Path, url: str, content_type: str) -> None:
+    """Envia o arquivo final diretamente para a URL assinada criada pelo Firebase."""
+    if not url:
+        raise ValueError("final_upload_url obrigatório para generate_long_project.")
+    raw = path.read_bytes()
+    req = urllib.request.Request(
+        url,
+        data=raw,
+        method="PUT",
+        headers={
+            "Content-Type": content_type,
+            "Content-Length": str(len(raw)),
+            "User-Agent": "CTEC-Qwen3/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            if status < 200 or status >= 300:
+                raise RuntimeError(f"Storage recusou upload do áudio final: HTTP {status}.")
+    except Exception as exc:
+        raise RuntimeError(f"Falha ao enviar áudio final ao Firebase Storage: {exc}") from exc
+
+
+def send_progress(
+    job: dict[str, Any],
+    *,
+    progress: float,
+    stage: str,
+    stage_label: str,
+    current_chunk: int,
+    total_chunks: int,
+    started_at: float,
+) -> None:
+    elapsed = max(0, int(round(time.monotonic() - started_at)))
+    payload = {
+        "progress": round(clamp(progress, 0.0, 0.98), 4),
+        "stage": stage,
+        "stageLabel": stage_label,
+        "currentChunk": int(current_chunk),
+        "totalChunks": int(total_chunks),
+        "elapsedSeconds": elapsed,
+    }
+    runpod.serverless.progress_update(job, json.dumps(payload, ensure_ascii=False))
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -518,6 +566,13 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
     if action in {"health", "config", "capabilities"}:
         return capabilities()
 
+    is_long_project = action == "generate_long_project"
+    final_upload_url = str(data.get("final_upload_url") or data.get("finalUploadUrl") or "").strip()
+    project_id = str(data.get("project_id") or data.get("projectId") or "").strip()
+    if is_long_project and not final_upload_url:
+        raise ValueError("generate_long_project exige final_upload_url.")
+    started_at = time.monotonic()
+
     original_text = str(data.get("text") or "").strip()
     if len(original_text) < 3:
         raise ValueError("O texto precisa ter pelo menos 3 caracteres.")
@@ -561,7 +616,17 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         sample_rate = None
         with wave.open(str(raw_wav), "wb") as writer:
             for index, (chunk, paragraph_end) in enumerate(chunks, 1):
-                runpod.serverless.progress_update(job, f"Qwen3-TTS: bloco {index} de {len(chunks)}")
+                # Firebase espera um JSON em runpod.progress para atualizar a UI real.
+                # Reservamos 5% para preparação e 90% para síntese dos blocos.
+                send_progress(
+                    job,
+                    progress=0.05 + (0.90 * (index - 1) / max(1, len(chunks))),
+                    stage="generating",
+                    stage_label=f"Gerando trecho {index} de {len(chunks)}",
+                    current_chunk=index - 1,
+                    total_chunks=len(chunks),
+                    started_at=started_at,
+                )
                 print(
                     f"[CTEC-QWEN] build={BUILD} bloco={index}/{len(chunks)} "
                     f"chars={len(chunk)} profile={profile}",
@@ -609,7 +674,10 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         if filt:
             cmd += ["-filter:a", filt]
         if output_format == "mp3":
-            cmd += ["-codec:a", "libmp3lame", "-b:a", "192k", str(final)]
+            bitrate = str(data.get("mp3_bitrate") or "192k").strip()
+            if not re.fullmatch(r"(?:64|96|128|160|192|256|320)k", bitrate):
+                bitrate = "192k"
+            cmd += ["-codec:a", "libmp3lame", "-b:a", bitrate, str(final)]
             mime = "audio/mpeg"
         else:
             cmd += ["-codec:a", "pcm_s16le", str(final)]
@@ -619,23 +687,30 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
         with sf.SoundFile(str(final)) as af:
             duration = round(len(af) / af.samplerate, 2)
 
-        return {
+        elapsed_seconds = max(0, int(round(time.monotonic() - started_at)))
+        common_result = {
             "status": "ok",
-            "action": "generate",
+            "action": action,
             "engine": "qwen3_tts",
             "build": BUILD,
             "contract_version": WORKER_CONTRACT_VERSION,
             "request_id": request_id,
             "text_hash": text_hash,
-            "audio_base64": encode_output(final),
+            "project_id": project_id,
             "mime_type": mime,
             "file_name": final.name,
             "sample_rate": sample_rate,
+            # A Function longa lê duration_seconds; a curta continua aceitando estimate.
+            "duration_seconds": duration,
             "duration_seconds_estimate": duration,
+            "elapsed_seconds": elapsed_seconds,
+            "size_bytes": final.stat().st_size,
             "device": DEVICE,
             "model": MODEL_ID,
             "chunks": len(chunks),
             "prepared_text": prepared_text,
+            "prepared_characters": len(prepared_text),
+            "prepared_text_hash": sha256_text(prepared_text),
             "reference_used": True,
             "clone_mode": "icl_full",
             "target_locale": "pt-BR",
@@ -650,6 +725,39 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 "text_mode": text_mode,
                 "engine": "qwen3_tts",
             },
+        }
+
+        if is_long_project:
+            if output_format != "mp3":
+                raise ValueError("generate_long_project exige output_format=mp3.")
+            send_progress(
+                job,
+                progress=0.96,
+                stage="uploading",
+                stage_label="Enviando áudio final",
+                current_chunk=len(chunks),
+                total_chunks=len(chunks),
+                started_at=started_at,
+            )
+            upload_file_to_signed_url(final, final_upload_url, "audio/mpeg")
+            print(
+                f"[CTEC-QWEN] projeto longo enviado | project={project_id or '-'} "
+                f"chunks={len(chunks)} bytes={final.stat().st_size} duration={duration}s",
+                flush=True,
+            )
+            # IMPORTANTE: projeto longo NÃO retorna Base64. O arquivo já existe
+            # no Storage quando a RunPod marca o job como COMPLETED.
+            return {
+                **common_result,
+                "uploaded": True,
+                "storage_delivery": "signed_put",
+            }
+
+        # Contrato curto permanece igual ao V4: áudio volta em Base64.
+        return {
+            **common_result,
+            "action": "generate",
+            "audio_base64": encode_output(final),
         }
 
 if __name__ == "__main__":
