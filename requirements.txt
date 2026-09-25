@@ -1,7 +1,6 @@
 runpod==1.7.13
-chatterbox-tts==0.1.7
+qwen-tts==0.1.1
 faster-whisper==1.1.1
-torchaudio==2.6.0
 soundfile==0.12.1
 numpy==1.26.4
 num2words==0.5.13
