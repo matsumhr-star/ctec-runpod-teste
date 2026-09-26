@@ -1,4 +1,3 @@
-
 import base64
 import hashlib
 import json
@@ -25,13 +24,13 @@ try:
 except Exception:
     WhisperModel = None
 
-BUILD = "CTEC-QWEN3-PTBR-ICL-V5-LONG-PROJECT-2026-09-25"
+BUILD = "CTEC-QWEN3-PTBR-ICL-V7-PTBR-PROSODIA-2026-09-26"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
 MAX_REFERENCE_BYTES = int(os.getenv("CTEC_MAX_REFERENCE_BYTES", str(30 * 1024 * 1024)))
 MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 * 1024 * 1024)))
-CHUNK_LIMIT = int(os.getenv("CTEC_QWEN_CHUNK_CHARS", "650"))
+CHUNK_LIMIT = int(os.getenv("CTEC_QWEN_CHUNK_CHARS", "1100"))
 WORKER_CONTRACT_VERSION = 4
 
 _MODEL = None
@@ -191,15 +190,34 @@ def normalize_law_text(text: str) -> str:
     )
     text = re.sub(r"(?m)^\s*([IVXLCDM]{1,12})\s*[—–-]\s*",
                   lambda m: f"Inciso {num2words(roman_int(m.group(1)), lang='pt_BR')}. ", text)
-    # Cabeçalhos em caixa alta viram fala natural sem alterar o texto original recebido.
+    # V7 — prosódia jurídica: mantém cabeçalho + nome no MESMO bloco de geração.
+    # Ex.: "CAPÍTULO II\nDAS COMPETÊNCIAS" -> "Capítulo dois, das competências."
+    # A vírgula cria a pausa humana sem abrir uma nova geração Qwen, reduzindo
+    # também as fronteiras em que apareciam artefatos e deriva de sotaque.
+    raw_lines = [ln.strip() for ln in text.splitlines()]
     lines = []
-    for line in text.splitlines():
-        s = line.strip()
+    i = 0
+    structural = re.compile(r"^(Título|Capítulo|Seção|Subseção|Livro|Parte)\b", re.I)
+    while i < len(raw_lines):
+        s = raw_lines[i]
+        if not s:
+            lines.append("")
+            i += 1
+            continue
         letters = [c for c in s if c.isalpha()]
         if letters and len(letters) >= 4 and sum(c.isupper() for c in letters) / len(letters) >= .85:
             s = s.lower()
             s = s[:1].upper() + s[1:]
+        if structural.match(s) and i + 1 < len(raw_lines):
+            nxt = raw_lines[i + 1].strip()
+            nxt_letters = [c for c in nxt if c.isalpha()]
+            if nxt and nxt_letters and sum(c.isupper() for c in nxt_letters) / len(nxt_letters) >= .75:
+                nxt = nxt.lower()
+                # vírgula = pausa curta/natural entre "Capítulo dois" e o nome.
+                s = s.rstrip(" .,:;—–-") + ", " + nxt.rstrip(" .,:;—–-") + "."
+                i += 1
         lines.append(s)
+        i += 1
     text = "\n".join(lines)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -264,7 +282,7 @@ def clean_icl_leading_artifact(
     - transcreve apenas o áudio recém-gerado com timestamps por palavra;
     - procura o começo real do texto solicitado;
     - só corta quando há fala reconhecida ANTES desse começo;
-    - preserva 60 ms antes da primeira palavra esperada para não comer fonema;
+    - preserva 35 ms antes da primeira palavra esperada para não comer fonema;
     - aplica fade-in curtíssimo para evitar clique de corte.
     """
     if audio.numel() == 0 or sample_rate <= 0:
@@ -336,9 +354,9 @@ def clean_icl_leading_artifact(
         # começa alguns milissegundos depois do artefato. Antes o V3 devolvia o
         # áudio intacto quando match_index == 0. Agora usamos o timestamp da
         # própria primeira palavra como guarda: só removemos o que estiver antes
-        # dela, preservando 60 ms de ataque.
-        start_sec = max(0.0, words[match_index][1] - 0.060)
-        if match_index == 0 and start_sec < 0.080:
+        # dela, preservando 35 ms de ataque.
+        start_sec = max(0.0, words[match_index][1] - 0.035)
+        if match_index == 0 and start_sec < 0.025:
             return audio, 0.0
         cut_samples = int(round(start_sec * sample_rate))
         if cut_samples <= 0 or cut_samples >= audio.shape[-1]:
@@ -662,6 +680,18 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 write_pcm16(writer, tensor)
                 silence(writer, sample_rate, 520 if paragraph_end else 260)
 
+                # Progresso REAL: só avança depois que o trecho terminou,
+                # passou pela limpeza de borda e foi gravado no WAV parcial.
+                send_progress(
+                    job,
+                    progress=0.05 + (0.90 * index / max(1, len(chunks))),
+                    stage="generating",
+                    stage_label=f"Trecho {index} de {len(chunks)} concluído",
+                    current_chunk=index,
+                    total_chunks=len(chunks),
+                    started_at=started_at,
+                )
+
         if sample_rate is None:
             raise RuntimeError("Nenhum áudio foi gerado.")
 
@@ -721,7 +751,8 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 "speed": speed,
                 "language": language,
                 "locale": "pt-BR",
-                "reference_language": "pt",
+                "reference_language": "pt-BR-ICL",
+                "chunk_chars_target": CHUNK_LIMIT,
                 "text_mode": text_mode,
                 "engine": "qwen3_tts",
             },
