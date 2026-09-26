@@ -24,13 +24,13 @@ try:
 except Exception:
     WhisperModel = None
 
-BUILD = "CTEC-QWEN3-PTBR-ICL-V7-PTBR-PROSODIA-2026-09-26"
+BUILD = "CTEC-QWEN3-PTBR-ICL-V8-LEITURA-CONTINUA-2026-09-26"
 MODEL_ID = os.getenv("CTEC_QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 MAX_TEXT_CHARS = int(os.getenv("CTEC_MAX_TEXT_CHARS", "120000"))
 MAX_REFERENCE_BYTES = int(os.getenv("CTEC_MAX_REFERENCE_BYTES", str(30 * 1024 * 1024)))
 MAX_RESULT_BASE64_BYTES = int(os.getenv("CTEC_MAX_RESULT_BASE64_BYTES", str(14 * 1024 * 1024)))
-CHUNK_LIMIT = int(os.getenv("CTEC_QWEN_CHUNK_CHARS", "1100"))
+CHUNK_LIMIT = int(os.getenv("CTEC_QWEN_CHUNK_CHARS", "1800"))
 WORKER_CONTRACT_VERSION = 4
 
 _MODEL = None
@@ -225,33 +225,78 @@ def normalize_law_text(text: str) -> str:
     return text.strip()
 
 def split_text(text: str, limit: int = CHUNK_LIMIT) -> list[tuple[str, bool]]:
-    limit = max(220, int(limit))
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    """
+    V8 — leitura contínua.
+
+    O ponto final, a vírgula, o ponto e vírgula e os dois-pontos NÃO criam uma
+    nova chamada ao Qwen. Eles permanecem dentro do mesmo bloco para que o
+    próprio modelo realize a prosódia em contexto. Só abrimos uma nova geração
+    quando o bloco contínuo alcança o limite seguro.
+
+    Parágrafos também podem compartilhar o mesmo bloco. A informação de fim de
+    parágrafo serve apenas para uma pausa discreta na fronteira REAL do chunk.
+    """
+    limit = max(700, int(limit))
+    normalized = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+
+    # Preserva parágrafos como unidades semânticas, mas não os transforma
+    # automaticamente em chamadas TTS independentes.
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", normalized) if p.strip()]
     out: list[tuple[str, bool]] = []
-    for paragraph in paragraphs:
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?;:])\s+", paragraph) if s.strip()]
+    current = ""
+
+    def flush(paragraph_end: bool = False) -> None:
+        nonlocal current
+        value = current.strip()
+        if value:
+            out.append((value, paragraph_end))
         current = ""
-        for sentence in sentences:
-            if len(sentence) > limit:
-                words = sentence.split()
-                for word in words:
-                    candidate = f"{current} {word}".strip()
-                    if current and len(candidate) > limit:
-                        out.append((current, False))
-                        current = word
-                    else:
-                        current = candidate
-                continue
-            candidate = f"{current} {sentence}".strip()
-            if current and len(candidate) > limit:
-                out.append((current, False))
-                current = sentence
-            else:
-                current = candidate
+
+    for paragraph in paragraphs:
+        # Se couber, acrescenta o parágrafo inteiro ao bloco atual. Assim,
+        # frases consecutivas continuam na MESMA geração Qwen.
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
         if current:
-            out.append((current, True))
-            current = ""
-    return out or [(text.strip(), True)]
+            flush(False)
+
+        if len(paragraph) <= limit:
+            current = paragraph
+            continue
+
+        # Parágrafo excepcionalmente grande: procura fronteiras naturais perto
+        # do limite, sem transformar cada ponto em um novo chunk.
+        rest = paragraph
+        while len(rest) > limit:
+            window = rest[: limit + 1]
+            cut = -1
+            # Prioridade: fim de frase; depois pontuação intermediária; por fim espaço.
+            for pattern in (r"[.!?](?:[\"'»”)]*)\s+", r"[;:]\s+", r",\s+", r"\s+"):
+                matches = list(re.finditer(pattern, window))
+                if matches:
+                    pos = matches[-1].end()
+                    if pos >= int(limit * 0.62):
+                        cut = pos
+                        break
+            if cut <= 0:
+                cut = limit
+                while cut > 1 and cut < len(rest) and not rest[cut - 1].isspace():
+                    cut -= 1
+                if cut <= 1:
+                    cut = limit
+            piece = rest[:cut].strip()
+            if piece:
+                out.append((piece, False))
+            rest = rest[cut:].strip()
+        current = rest
+
+    flush(True)
+    return out or [(normalized, True)]
 
 def numpy_to_tensor(wav: np.ndarray) -> torch.Tensor:
     audio = np.asarray(wav, dtype=np.float32)
@@ -572,6 +617,7 @@ def capabilities() -> dict[str, Any]:
         "reference_max_seconds": 12,
         "voice_clone_mode": "icl_full_ref_audio_plus_ref_text",
         "boundary_cleanup": "asr_expected_text_guard_v2_plus_ref_tail_silence",
+        "reading_strategy": "continuous_semantic_blocks_punctuation_inside_generation",
         "reference_transcription": "faster_whisper_pt",
         "target_locale": "pt-BR",
         "languages": list(LANGUAGES.keys()),
@@ -678,7 +724,7 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 )
 
                 write_pcm16(writer, tensor)
-                silence(writer, sample_rate, 520 if paragraph_end else 260)
+                silence(writer, sample_rate, 180 if paragraph_end else 90)
 
                 # Progresso REAL: só avança depois que o trecho terminou,
                 # passou pela limpeza de borda e foi gravado no WAV parcial.
@@ -753,6 +799,7 @@ def generate(job: dict[str, Any]) -> dict[str, Any]:
                 "locale": "pt-BR",
                 "reference_language": "pt-BR-ICL",
                 "chunk_chars_target": CHUNK_LIMIT,
+                "reading_strategy": "continuous_semantic_blocks",
                 "text_mode": text_mode,
                 "engine": "qwen3_tts",
             },
